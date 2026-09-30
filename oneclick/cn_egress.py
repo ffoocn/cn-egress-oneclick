@@ -615,7 +615,7 @@ class Controller:
 
     def menu(self):
         while True:
-            print('\n国内出口管理：香港 → 一个大陆中转 → 国内出口')
+            print('\n一键安装与管理')
             print('1 配置 SSH 节点   2 一键安装/接管现有部署   3 状态   4 诊断')
             print('5 启动   6 停止   7 重启   8 日志   9 备份')
             print('10 客户端列表   11 新增客户端   12 导出配置   13 撤销客户端')
@@ -647,7 +647,7 @@ class Controller:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='国内出口 VPN 一键安装与管理（保留主机原服务）')
+    parser = argparse.ArgumentParser(description='一键安装与管理')
     parser.add_argument('--state-dir', default=str(ROOT / 'private'))
     parser.add_argument('--config', help='节点 JSON 配置；不应包含密码')
     sub = parser.add_subparsers(dest='command')

@@ -1,10 +1,8 @@
-# 国内出口一键安装与管理
-
-当前链路：手机 / Windows → 香港 → 一个大陆中转 → 国内出口机 → 国内宽带。两段服务器隧道使用 WireGuard + WSS/TLS，终端继续使用 WireGuard。
+# 一键安装与管理
 
 ## 最快使用
 
-单文件 `cn-egress-oneclick.sh` 已包含管理程序和固定版本的 WSS 软件包。通过 GitHub 下载并打开菜单：
+运行以下命令下载并打开菜单：
 
 ```bash
 curl -fL https://raw.githubusercontent.com/ffoocn/cn-egress-oneclick/main/cn-egress-oneclick.sh -o cn-egress-oneclick.sh && chmod +x cn-egress-oneclick.sh && ./cn-egress-oneclick.sh
@@ -85,8 +83,6 @@ bash cn-egress-oneclick.sh uninstall --yes
 
 ## 诊断和验证范围
 
-`doctor` 检查本机服务、隔离命名空间、回环 Endpoint、保护规则与证书等配置；健康状态不等于手机办税业务通过。完整访问仍需真实客户端开启 WireGuard，确认国内出口 IP，并在浏览器 / App 验证页面和登录。当前双 WAN 出口可能随目标变化，此脚本不改变办公室路由器策略。
-
-安装保留主机原业务路由。香港、大陆的用户转发在独立网络命名空间，国内出口 NAT 仅匹配 VPN 客户端网段。两段服务器链路通过 TCP443 使用 TLS 双向认证；手机 / Windows 到香港的第一段仍为普通 WireGuard。WSS 故障不回退到原公网 UDP，不能保证防封禁或账号不触发风控。
+`doctor` 检查节点服务和配置；完整验证仍需客户端连接后测试实际业务访问。
 
 软件固定使用 [wstunnel v11.0.0 官方发布](https://github.com/erebe/wstunnel/releases/tag/v11.0.0)。包内包含经 SHA256 校验的公开 amd64 安装包，可在新安装时离线复用；其他依赖仍可能需要 APT 网络。所有下载均验证固定版本和架构，不跳过校验。发布包只包含公开代码与公开软件，不含账号密码、真实 WireGuard 配置、客户端私钥或节点证书私钥。
