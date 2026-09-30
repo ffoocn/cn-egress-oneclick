@@ -1,6 +1,6 @@
 # Third-party software
 
-The installer embeds the official wstunnel v11.0.0 Linux amd64 release archive.
+The installer downloads official wstunnel v11.0.0 Linux amd64 or arm64 release archives and verifies their SHA-256 checksums.
 
 - Upstream: https://github.com/erebe/wstunnel
 - Release: https://github.com/erebe/wstunnel/releases/tag/v11.0.0

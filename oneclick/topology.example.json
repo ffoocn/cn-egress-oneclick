@@ -1,8 +1,0 @@
-{
-  "hk": {"host": "203.0.113.10", "user": "root", "port": 22},
-  "sh": {"host": "198.51.100.20", "user": "root", "port": 22},
-  "exit": {"host": "192.168.1.2", "user": "vpnadmin", "port": 22},
-  "transport": "wss",
-  "wss_port": 443,
-  "user_port": 51820
-}

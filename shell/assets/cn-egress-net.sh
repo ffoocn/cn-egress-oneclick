@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 action=${1:?start or stop}
-role=${2:?hk, sh, exit or test}
+role=${2:?hk, sh or exit}
 config_dir=/etc/cn-egress
 relay_ns=cn-egress-relay
 relay_pending=()
@@ -160,31 +160,16 @@ start_sh() {
 }
 
 start_exit() {
+    if [[ $(sysctl -n net.ipv4.ip_forward) != 1 ]]; then
+        printf '出口机尚未启用 IPv4 转发，请在安装菜单确认后启用。\n' >&2
+        return 1
+    fi
     load_firewall
     wg_up cne-exit
     ip route replace 10.77.10.0/24 dev cne-exit
     ip -6 route replace fd77:77:10::/64 dev cne-exit
     docker_rules_up
     # IPv6 is rejected by the owned firewall until a domestic IPv6 exit is configured.
-    sysctl -q -w net.ipv4.ip_forward=1
-}
-
-start_test() {
-    if ip netns list | cut -d' ' -f1 | /usr/bin/grep -qx cn-egress-test; then
-        printf 'Test namespace already exists\n'
-        return
-    fi
-    ip netns add cn-egress-test
-    # The encrypted transport socket remains in the original host namespace.
-    ip link add cne-test type wireguard
-    ip link set cne-test netns cn-egress-test
-    ip netns exec cn-egress-test wg setconf cne-test "$config_dir/us-test.wg"
-    ip -n cn-egress-test address add 10.77.10.250/32 dev cne-test
-    ip -n cn-egress-test -6 address add fd77:77:10::250/128 dev cne-test
-    ip -n cn-egress-test link set lo up
-    ip -n cn-egress-test link set cne-test mtu 1380 up
-    ip -n cn-egress-test route add default dev cne-test
-    ip -n cn-egress-test -6 route add default dev cne-test
 }
 
 stop_role() {
@@ -200,11 +185,6 @@ stop_role() {
             wg_down cne-exit
             docker_rules_down
             ;;
-        test)
-            ip -n cn-egress-test link delete cne-test 2>/dev/null || true
-            ip netns delete cn-egress-test 2>/dev/null || true
-            return
-            ;;
         *) exit 2 ;;
     esac
     nft delete table inet cn_egress 2>/dev/null || true
@@ -217,7 +197,6 @@ case "$action" in
             hk) start_hk ;;
             sh) start_sh ;;
             exit) start_exit ;;
-            test) start_test ;;
             *) exit 2 ;;
         esac
         trap - ERR
