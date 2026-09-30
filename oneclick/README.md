@@ -8,7 +8,7 @@
 curl -fL https://raw.githubusercontent.com/ffoocn/cn-egress-oneclick/main/cn-egress-oneclick.sh -o cn-egress-oneclick.sh && chmod +x cn-egress-oneclick.sh && ./cn-egress-oneclick.sh
 ```
 
-`-o` 指定保存文件；不带它只会将脚本打印到终端。`-f` 遇到 HTTP 错误会停止，避免继续执行错误页面。此命令先打开菜单；选择安装才会部署服务。
+`-o` 指定保存文件；不带它只会将脚本打印到终端。`-f` 遇到 HTTP 错误会停止，避免继续执行错误页面。此命令先打开菜单；选择安装才会部署服务。 首次运行会自动检测并补装管理机缺少的依赖，完成后继续打开菜单。
 
 在能 SSH 访问三台机器的 Linux 或 macOS 管理电脑上，也可直接运行下载好的文件：
 
@@ -30,12 +30,14 @@ sudo cn-egress
 
 ## 运行条件
 
-- 管理电脑：Python 3.9 或更新版本、OpenSSH 客户端。新建证书还需要 OpenSSL；macOS 系统 LibreSSL 可用于本工具的 EC 证书生成，不依赖它生成 WireGuard 密钥。
-- 三个节点：运行 systemd 的 Debian / Ubuntu Linux，当前版本节点安装支持 x86_64。脚本在依赖缺失时只安装所需软件包；软件索引缺失时刷新 APT 索引并重新检查最小安装计划。如现有 APT / dpkg 未完成或安装会升级已有软件，会停止并说明原因，避免修复或升级原有环境。
+- 管理电脑：启动时自动检查 Python 3.9+（完整标准库）、SSH 客户端、OpenSSL 和 Linux CA 证书包。缺少时使用当前系统软件源补装，再自动进入菜单；已有依赖会直接使用，不需要 pip。Linux 支持 APT、DNF / YUM、APK；macOS 使用已安装的 Homebrew。自动安装需要 root 或可用的 sudo，Homebrew 使用普通用户。
+- 三个节点：运行 systemd 的 Debian / Ubuntu Linux，并已有可用的 Python 3.9+；当前版本节点安装支持 x86_64。管理机的启动依赖检查和节点安装是两步操作。脚本在依赖缺失时只安装所需软件包；软件索引缺失时刷新 APT 索引并重新检查最小安装计划。如现有 APT / dpkg 未完成或安装会升级已有软件，会停止并说明原因，避免修复或升级原有环境。
 - 国内出口机需已启用 IPv4 转发。自动安装不会将原本关闭的宿主转发改为开启，因为该参数变化可能重置其他 IPv4 设置。[Linux 内核说明](https://docs.kernel.org/networking/ip-sysctl.html)
 - 管理电脑能访问三台机器的 SSH，包括 `192.168.1.2`。适合在国内办公室网络运行；远程管理需已有管理网络。脚本不会开放 NAS 的公网 SSH。
 - 云安全组允许香港用户端口 UDP51820、大陆 WSS 端口 TCP443。云控制台规则不由脚本修改；本机端口已占用时会在安装前停止。
 - 大陆中转只能填写一个节点。若选北京，在配置中替换 `sh.host`，不要同时填写上海和北京。现有部署更换中转属于迁移，工具会拒绝自动覆盖不完整或混合的三节点部署。
+
+Linux 安装前会检查软件包方案；软件源没有兼容 Python、软件包状态未完成，或方案需要升级 / 删除已有软件时，会说明原因并停止。macOS 交由已有的 Homebrew 安装缺少的工具及必要依赖。不自动更换软件源或替换系统 Python。
 
 ## 命令方式
 

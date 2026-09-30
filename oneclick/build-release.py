@@ -19,7 +19,7 @@ import tempfile
 import textwrap
 import zipfile
 
-CORE = ("cn_egress.py", "node.py", "render.py", "cn-egress.sh", "topology.example.json", "README.md")
+CORE = ("cn_egress.py", "node.py", "render.py", "cn-egress.sh", "bootstrap-deps.sh", "topology.example.json", "README.md")
 ASSETS = ("assets/cn-egress-net.sh", "assets/cn-egress-obfs.py", "assets/cn-egress-wss-restrictions.yaml")
 SOFTWARE = ("software/wstunnel_11.0.0_linux_amd64.tar.gz",
             "software/wstunnel_11.0.0_linux_arm64.tar.gz",
@@ -33,12 +33,10 @@ MAX_BUNDLE = 200 * 1024 * 1024
 # FD 3 preserves the caller's original stdin for the interactive management menu.
 SHELL_HEADER = '''#!/usr/bin/env bash
 set -euo pipefail
-if ! command -v python3 >/dev/null 2>&1; then
-  echo '需要 Python 3.9 或更新版本：Debian/Ubuntu 可安装 python3。' >&2
-  exit 1
-fi
+__DEPENDENCY_BOOTSTRAP__
+cne_ensure_dependencies
 exec 3<&0
-exec python3 -I - "$@" <<'CNE_ONECLICK_BOOTSTRAP_V1'
+exec "$CNE_PYTHON" -I - "$@" <<'CNE_ONECLICK_BOOTSTRAP_V1'
 '''
 
 BOOTSTRAP = '''import sys
@@ -248,13 +246,16 @@ def public_archive(source: Path) -> bytes:
 def launcher(archive: bytes) -> bytes:
     if len(archive) > MAX_BUNDLE:
         raise ValueError("Embedded ZIP exceeds size limit")
+    with zipfile.ZipFile(io.BytesIO(archive)) as package:
+        dependencies = package.read("bootstrap-deps.sh").decode("utf-8")
     payload = "\n".join(textwrap.wrap(base64.b64encode(archive).decode(), width=76))
     bootstrap = (BOOTSTRAP.replace("__REQUIRED__", repr(REQUIRED))
                  .replace("__ALLOWED__", repr(ALLOWED))
                  .replace("__DIGEST__", repr(hashlib.sha256(archive).hexdigest()))
                  .replace("__MAX_BUNDLE__", str(MAX_BUNDLE))
                  .replace("__PAYLOAD__", payload))
-    return (SHELL_HEADER + bootstrap + "\nCNE_ONECLICK_BOOTSTRAP_V1\n").encode()
+    header = SHELL_HEADER.replace("__DEPENDENCY_BOOTSTRAP__", dependencies)
+    return (header + bootstrap + "\nCNE_ONECLICK_BOOTSTRAP_V1\n").encode()
 
 
 def _atomic_output(path: Path, contents: bytes, mode: int) -> None:

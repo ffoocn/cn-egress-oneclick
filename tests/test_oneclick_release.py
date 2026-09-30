@@ -39,6 +39,8 @@ if options.read_stdin:
 print(input() if options.read_stdin else render.LABEL)
 ''')
         (self.source / "cn-egress.sh").chmod(0o755)
+        (self.source / "bootstrap-deps.sh").write_bytes(
+            (Path(__file__).resolve().parents[1] / "oneclick/bootstrap-deps.sh").read_bytes())
         self.output = self.root / "output"
         self.home = self.root / "installed"
 
