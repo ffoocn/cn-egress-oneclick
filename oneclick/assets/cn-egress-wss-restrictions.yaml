@@ -1,0 +1,20 @@
+restrictions:
+  - name: hk-wireguard
+    match:
+      - !PathPrefix "^cn-egress-hk$"
+    allow:
+      - !Tunnel
+        protocol: [Udp]
+        port: ["51821"]
+        host: "^$"
+        cidr: ["127.0.0.1/32"]
+
+  - name: exit-wireguard
+    match:
+      - !PathPrefix "^cn-egress-exit$"
+    allow:
+      - !Tunnel
+        protocol: [Udp]
+        port: ["51822"]
+        host: "^$"
+        cidr: ["127.0.0.1/32"]

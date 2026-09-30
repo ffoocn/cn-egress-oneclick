@@ -1,0 +1,11 @@
+**/private/
+**/__pycache__/
+*.pyc
+*.conf
+*.key
+*.pem
+*.zip
+*.png
+.DS_Store
+.release-build.lock
+.bundle.lock
