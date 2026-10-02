@@ -31,12 +31,31 @@ cleanup() {
     exit "$result"
 }
 trap cleanup EXIT
+mobile_path_check() {
+    # A deliberately crashed server loses ephemeral WG sessions. Keep the
+    # unchanged live client running and allow the normal rekey/retry interval.
+    docker exec -i "$prefix-client" bash -s <<'MOBILE_PATH'
+set -Eeuo pipefail
+deadline=$((SECONDS+180))
+while ((SECONDS<deadline)); do
+    response=$(ip netns exec cn-mobile-test dig +time=1 +tries=1 +short @10.77.30.2 www.baidu.com A 2>/dev/null) || response=''
+    address=$(awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print;exit}' <<< "$response")
+    if [[ -n $address ]]; then
+        code=$(ip netns exec cn-mobile-test curl --noproxy '*' --connect-timeout 3 --max-time 8 --resolve "www.baidu.com:443:$address" -sS -o /dev/null -w '%{http_code}' https://www.baidu.com/ 2>/dev/null) || code=''
+        if [[ $code == 200 ]]; then printf 'Live unchanged mobile profile: DNS and verified HTTPS passed.\n'; exit 0; fi
+    fi
+    sleep 1
+done
+printf 'The unchanged mobile client did not reconnect within 180 seconds.\n' >&2
+exit 1
+MOBILE_PATH
+}
 # Benchmark-range fixture represents the WAN, separately from private relays.
 docker network create --subnet 198.18.64.0/24 "$prefix-wan" >/dev/null; networks+=("$prefix-wan")
 for role in hk sh exit site client; do
     network=$prefix-wan
     args=(run -d --privileged --network "$network" --name "$prefix-$role" -v "$repo:/repo:ro" -v "$assets:/assets:ro")
-    case $role in hk|sh|exit) args+=(-e container=docker cn-egress-test:local /lib/systemd/systemd);; *) args+=(cn-egress-test:local sleep infinity);; esac
+    case $role in hk|sh|exit) args+=(-e container=docker "${CNE_TEST_IMAGE:-cn-egress-test:local}" /lib/systemd/systemd);; *) args+=("${CNE_TEST_IMAGE:-cn-egress-test:local}" sleep infinity);; esac
     docker "${args[@]}" >/dev/null
     containers+=("$prefix-$role")
 done
@@ -148,11 +167,80 @@ docker exec "$prefix-hk" systemctl kill --signal=KILL cn-egress-users.service
 docker exec "$prefix-hk" bash -c 'for i in $(seq 1 100); do if ! systemctl is-active --quiet cn-egress.service && ! ip netns list | grep -q cn-egress-relay; then exit 0; fi; sleep 0.1; done; exit 1'
 docker exec "$prefix-hk" systemctl start cn-egress.service cn-egress-obfs.service
 docker exec "$prefix-hk" /usr/local/sbin/cn-egress-probe
+mobile_path_check
 for role in hk sh exit; do
     docker exec "$prefix-$role" bash -c 'ip -4 route show default | cmp -s /tmp/default.before -; ip -4 rule show | cmp -s /tmp/rules.before -; kill -0 "$(cat /tmp/business.pid)"; [[ $(curl --noproxy "*" --cacert /tmp/business.crt --resolve www.baidu.com:9443:127.0.0.1 -sS --max-time 5 -o /dev/null -w "%{http_code}" https://www.baidu.com:9443/) == 200 ]]'
     value=0; [[ $role != exit ]] || value=1
     [[ $(docker exec "$prefix-$role" sysctl -n net.ipv4.ip_forward) == "$value" ]]
 done
+# Rotate the real three-node mTLS chain without touching the live mobile keys.
+for role in hk sh exit; do
+    docker exec -i "$prefix-$role" bash -s -- "$role" <<'SNAPSHOT'
+set -Eeuo pipefail
+source /repo/cn-egress-oneclick.sh
+CNE_NODE_LIBRARY=1 source <(cne_node_source)
+cne_node_main maintenance-info "$1" > /tmp/maintenance.before
+backup=$(cne_node_main backup "$1")
+printf '%s\n' "$backup" > /tmp/maintenance.backup
+cne_node_main backup-export "$1" "$backup" > /tmp/maintenance.base64
+SNAPSHOT
+    docker cp "$prefix-$role:/tmp/maintenance.base64" "$work/$role.base64" >/dev/null
+done
+docker exec -i "$prefix-hk" bash -s -- "$sh" <<'RENEW_PKI'
+set -Eeuo pipefail
+source /repo/cn-egress-oneclick.sh
+cne_render_pki /tmp/renew-pki "$1"
+for role in hk sh exit; do
+    mkdir "/tmp/renew-$role"
+    cp /tmp/renew-pki/ca.crt "/tmp/renew-$role/ca.crt"
+    cp "/tmp/renew-pki/$role.crt" "/tmp/renew-$role/node.crt"
+    cp "/tmp/renew-pki/$role.key" "/tmp/renew-$role/node.key"
+    tar -czf "/tmp/renew-$role.tar.gz" -C "/tmp/renew-$role" ca.crt node.crt node.key
+done
+RENEW_PKI
+for role in sh exit hk; do
+    docker cp "$prefix-hk:/tmp/renew-$role.tar.gz" "$work/renew-$role.tar.gz" >/dev/null
+    docker cp "$work/renew-$role.tar.gz" "$prefix-$role:/root/renew.tar.gz" >/dev/null
+    docker exec -i "$prefix-$role" bash -s -- "$role" <<'RENEW'
+set -Eeuo pipefail
+source /repo/cn-egress-oneclick.sh
+CNE_NODE_LIBRARY=1 source <(cne_node_source)
+chmod 600 /root/renew.tar.gz
+chown root:root /root/renew.tar.gz
+before=$(cat /tmp/maintenance.before)
+cne_node_main certificate-apply "$1" /root/renew.tar.gz none 20261002T000000Z-c0ffee123456
+after=$(cne_node_main maintenance-info "$1")
+cne_renew_state_same "$before" "$after"
+[[ $(cne_field "$after" deployment) == 20261002T000000Z-c0ffee123456 && $(cne_field "$after" ca_sha256) != "$(cne_field "$before" ca_sha256)" ]]
+RENEW
+done
+docker exec "$prefix-hk" /usr/local/sbin/cn-egress-probe
+mobile_path_check
+printf 'PASS: real three-node certificate rotation retains all non-TLS configuration, service states and the connected mobile profile\n'
+# Lose the remote archives, then import the portable snapshots from the manager.
+for role in sh exit hk; do
+    docker cp "$work/$role.base64" "$prefix-$role:/root/restore.base64" >/dev/null
+    docker exec -i "$prefix-$role" bash -s -- "$role" <<'HISTORY'
+set -Eeuo pipefail
+source /repo/cn-egress-oneclick.sh
+CNE_NODE_LIBRARY=1 source <(cne_node_source)
+archive=$(cat /tmp/maintenance.backup)
+rm "$archive"
+base64 -d /root/restore.base64 > /root/restore.tar.gz
+chmod 600 /root/restore.tar.gz
+chown root:root /root/restore.tar.gz
+cne_node_main restore-import "$1" /root/restore.tar.gz "${archive##*/}" 20261002T000000Z-c0ffee123456 20261002T000001Z-c0ffee654321
+before=$(cat /tmp/maintenance.before); after=$(cne_node_main maintenance-info "$1")
+cne_renew_state_same "$before" "$after"
+[[ $(cne_field "$before" tls_sha256) == "$(cne_field "$after" tls_sha256)" && $(cne_field "$after" deployment) == 20261002T000001Z-c0ffee654321 ]]
+HISTORY
+done
+docker exec "$prefix-hk" /usr/local/sbin/cn-egress-probe
+mobile_path_check
+for role in hk sh exit; do
+    docker exec "$prefix-$role" bash -c 'ip -4 route show default | cmp -s /tmp/default.before -; ip -4 rule show | cmp -s /tmp/rules.before -; kill -0 "$(cat /tmp/business.pid)"; [[ $(curl --noproxy "*" --cacert /tmp/business.crt --resolve www.baidu.com:9443:127.0.0.1 -sS --max-time 5 -o /dev/null -w "%{http_code}" https://www.baidu.com:9443/) == 200 ]]'
+done
+printf 'PASS: imported historical snapshots restore the running three-node chain after remote backup loss, with business services and routes preserved\n'
 # Stopping the relay must fail DNS instead of falling back to HK's host WAN.
 docker exec "$prefix-sh" systemctl stop cn-egress.service
 docker exec "$prefix-sh" bash -c 'kill -0 "$(cat /tmp/business.pid)"; [[ $(curl --noproxy "*" --cacert /tmp/business.crt --resolve www.baidu.com:9443:127.0.0.1 -sS --max-time 5 -o /dev/null -w "%{http_code}" https://www.baidu.com:9443/) == 200 ]]'

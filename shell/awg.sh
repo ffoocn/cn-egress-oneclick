@@ -20,21 +20,7 @@ cne_awg_cleanup() {
 
 # URL SHA256 CACHE_FILE; publish only a completely verified download.
 cne_awg_download() {
-    local url=$1 checksum=$2 archive=$3 temporary actual
-    [[ ! -L $archive ]] || return 1
-    if [[ -f $archive ]]; then
-        actual=$(sha256sum "$archive" | awk '{print $1}') || return 1
-        [[ $actual != "$checksum" ]] || return 0
-    fi
-    temporary=$(mktemp "$CNE_TEMP/awg-download.XXXXXXXX") || return 1
-    if ! curl -fL --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$temporary"; then rm -f "$temporary"; cne_error "组件下载失败：$url。配置尚未替换；请检查网络或 HTTPS_PROXY 后重试。"; return 1; fi
-    actual=$(sha256sum "$temporary" | awk '{print $1}') || { rm -f "$temporary"; return 1; }
-    if [[ $actual != "$checksum" ]]; then
-        rm -f "$temporary"
-        cne_error 'AmneziaWG 组件校验失败，已停止。'
-        return 1
-    fi
-    chmod 600 "$temporary" && mv "$temporary" "$archive"
+    cne_download_verified "$1" "$2" "$3" 'AmneziaWG 组件'
 }
 
 # TARGET_ARCH -> CNE_AWG_ENGINE and CNE_AWG_TOOLS_SOURCE. Build on the manager;
@@ -58,7 +44,7 @@ cne_fetch_awg() {
     engine=$CNE_STATE/cache/amneziawg-go-0.2.16-linux-$target
     digest=$engine.sha256
     [[ ! -L $engine && ! -L $digest ]] || return 1
-    if [[ -x $engine && -f $digest ]]; then
+    if [[ ${CNE_AWG_FORCE_MODULE_CACHE:-0} != 1 && -x $engine && -f $digest ]]; then
         IFS= read -r existing < "$digest" || return 1
         if [[ $existing =~ ^[0-9a-f]{64}$ && $(sha256sum "$engine" | awk '{print $1}') == "$existing" ]]; then
             CNE_AWG_ENGINE=$engine; CNE_AWG_TOOLS_SOURCE=$tools_archive
@@ -69,14 +55,16 @@ cne_fetch_awg() {
     mkdir "$work/source" "$work/gocache" "$work/gomodcache" || return 1
     tar -xzf "$go_archive" -C "$work" || return 1
     tar -xzf "$engine_archive" --strip-components=1 -C "$work/source" || return 1
+    cne_download_modules_seed "$work" "$target" "$engine_archive" || { cne_awg_cleanup "$work" || :; return 1; }
     # GOTOOLCHAIN=local prevents a source directive from fetching another Go.
     # Go verifies dependencies against the source's go.sum and checksum database.
     (cd "$work/source" && timeout --signal=TERM --kill-after=10s 600s env CGO_ENABLED=0 GOOS=linux GOARCH="$target" \
         GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS= GOAMD64=v1 GOARM64=v8.0 \
         GOPRIVATE= GONOSUMDB= GONOPROXY= GOINSECURE= GOCACHE="$work/gocache" \
-        GOMODCACHE="$work/gomodcache" GOPROXY=https://proxy.golang.org \
+        GOMODCACHE="$work/gomodcache" GOPROXY="$CNE_GO_PROXY" \
         GOSUMDB=sum.golang.org "$work/go/bin/go" build -mod=readonly -trimpath \
-        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
+        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请在菜单 18 检查 Go 模块代理，或在菜单 19 准备/导入完整缓存后重试。'; return 1; }
+    cne_download_modules_publish "$work" "$target" "$engine_archive" || { cne_awg_cleanup "$work" || :; return 1; }
     chmod 755 "$work/amneziawg-go" || return 1
     existing=$(sha256sum "$work/amneziawg-go" | awk '{print $1}') || return 1
     printf '%s\n' "$existing" > "$work/engine.sha256" || return 1

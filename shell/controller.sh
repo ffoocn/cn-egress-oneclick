@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.1.1
+CNE_VERSION=2.2.0
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -55,7 +55,7 @@ cne_setup_prompt() {
 }
 cne_mutation_guard() {
     [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || {
-        cne_error '存在尚未完成恢复的安装。请先选择“15. 重试恢复”，恢复前可以查看状态、日志和诊断。'
+        cne_error '存在尚未完成恢复的操作。请先选择“15. 重试恢复”，恢复前可以查看状态、日志和诊断。'
         return 1
     }
 }
@@ -77,8 +77,11 @@ cne_initialize() {
     cne_safe_directory "$CNE_STATE" || return 1
     [[ ! -L $CNE_STATE/lock ]] || return 1
     exec 8>"$CNE_STATE/lock"
-    flock -n 8 || { cne_error '已有管理菜单运行，请先退出那个窗口。'; return 1; }
-    for child in cache clients history; do cne_safe_directory "$CNE_STATE/$child" || return 1; done
+    if ! flock -n 8; then
+        if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then cne_note '管理菜单或其他维护正在运行，本次自动检查延后 15 分钟。'; return 75; fi
+        cne_error '已有管理菜单运行，请先退出那个窗口。'; return 1
+    fi
+    for child in cache clients history backups; do cne_safe_directory "$CNE_STATE/$child" || return 1; done
     CNE_TEMP=$(mktemp -d "$CNE_STATE/.session.XXXXXX") || return 1
     [[ ! -L $CNE_STATE/known_hosts ]] || return 1
     touch "$CNE_STATE/known_hosts" && chmod 600 "$CNE_STATE/known_hosts" || return 1
@@ -217,7 +220,11 @@ cne_setup() {
     CNE_PASSWORDS=('' '' ''); CNE_SUDOS=('' '' '')
     printf '\n节点已保存。SSH 密码仅在本次运行期间使用。\n'
 }
-cne_require_config() { [[ -n ${CNE_HOSTS[0]} && -n ${CNE_HOSTS[1]} && -n ${CNE_HOSTS[2]} ]] || cne_setup; }
+cne_require_config() {
+    [[ -n ${CNE_HOSTS[0]} && -n ${CNE_HOSTS[1]} && -n ${CNE_HOSTS[2]} ]] && return 0
+    [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error '自动维护缺少三个节点的配置，请先运行管理菜单。'; return 1; }
+    cne_setup
+}
 cne_authenticate() {
     local idx=$1
     if [[ -f $CNE_TEMP/auth-failed-$idx ]]; then
@@ -228,8 +235,10 @@ cne_authenticate() {
         CNE_PASSWORDS[$idx]=''; CNE_SUDOS[$idx]=''
         if [[ $(id -u) != 0 ]]; then
             command -v sudo >/dev/null 2>&1 || { cne_error '管理本机服务需要 root 或 sudo。'; return 1; }
-            [[ ${CNE_AUTH_READY[$idx]} == 1 ]] || cne_note '本机管理需要管理员权限，请完成 sudo 验证。'
-            sudo -v || return 1
+            if [[ ${CNE_NONINTERACTIVE:-0} != 1 ]]; then
+                [[ ${CNE_AUTH_READY[$idx]} == 1 ]] || cne_note '本机管理需要管理员权限，请完成 sudo 验证。'
+                sudo -v || return 1
+            fi
         fi
         CNE_AUTH_READY[$idx]=1
         return 0
@@ -240,6 +249,12 @@ cne_authenticate() {
         return 1
     fi
     cne_bootstrap ssh || return 1
+    if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+        [[ ${CNE_IDENTITIES[$idx]} != - ]] || { cne_error "${CNE_LABELS[$idx]}自动维护需要 SSH 密钥登录。"; return 1; }
+        ssh-keygen -y -P '' -f "${CNE_IDENTITIES[$idx]}" </dev/null >/dev/null 2>&1 || { cne_error "${CNE_LABELS[$idx]}自动维护需要无需口令的 SSH 私钥。"; return 1; }
+        CNE_PASSWORDS[$idx]=''; CNE_SUDOS[$idx]=''; CNE_AUTH_READY[$idx]=1
+        return 0
+    fi
     [[ ${CNE_AUTH_READY[$idx]} == 1 ]] && return 0
     if [[ ${CNE_IDENTITIES[$idx]} == - ]]; then
         cne_secret "${CNE_LABELS[$idx]} ${CNE_HOSTS[$idx]} SSH 密码" || return 1
@@ -259,9 +274,14 @@ cne_send_script() {
     if [[ ${CNE_CONNECTIONS[$idx]:-ssh} == local ]]; then
         if [[ $(id -u) == 0 ]]; then /bin/bash "$script" </dev/null
         else
+            if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+                sudo -n -k /bin/bash "$script" </dev/null
+                return $?
+            fi
             # Refresh valid sudo timestamps between operations. A long build
             # can outlive the cache; revalidate before executing the RPC file.
             if ! sudo -n -v 2>/dev/null; then
+                [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error '自动维护的本机 sudo 验证失败。'; return 1; }
                 cne_note '本机管理员授权已过期，请重新完成 sudo 验证。'
                 sudo -v || return 1
             fi
@@ -270,6 +290,13 @@ cne_send_script() {
         return $?
     fi
     local args=(-T -F /dev/null -p "${CNE_PORTS[$idx]}" -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$CNE_STATE/known_hosts" -o LogLevel=ERROR -o NumberOfPasswordPrompts=1)
+    if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+        args+=(-i "${CNE_IDENTITIES[$idx]}" -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no)
+        command='/bin/bash -s'; [[ ${CNE_USERS[$idx]} == root ]] || command='sudo -n -k /bin/bash -s'
+        args+=("${CNE_USERS[$idx]}@${CNE_HOSTS[$idx]}" "$command")
+        ssh "${args[@]}" < "$script"
+        return $?
+    fi
     local password_args=(-d 9)
     if [[ ${CNE_IDENTITIES[$idx]} == - ]]; then args+=(-o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive)
     else args+=(-i "${CNE_IDENTITIES[$idx]}" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no); password_args+=(-P passphrase); fi
@@ -315,6 +342,27 @@ cne_remote_install() {
     if [[ $result != 0 ]]; then CNE_AUTH_READY[$idx]=0; : > "$CNE_TEMP/auth-failed-$idx"; fi
     return "$result"
 }
+cne_remote_payload() {
+    local idx=$1 action=$2 archive=$3 script result
+    shift 3
+    [[ $action == certificate-apply || $action == restore-import ]] && [[ -f $archive && ! -L $archive && -O $archive ]] || return 1
+    script=$(mktemp "$CNE_TEMP/payload.XXXXXX") || return 1
+    {
+        printf 'set -Eeuo pipefail\nexport LC_ALL=C\nCNE_NODE_LIBRARY=1\n'
+        cne_node_source
+        printf '\ncne_upload=$(mktemp /root/.cn-egress-maintenance.XXXXXXXX)\ntrap '\''rm -f "$cne_upload"'\'' EXIT\n'
+        printf 'base64 -d > "$cne_upload" <<'\''CNE_MAINTENANCE_PAYLOAD_V3'\''\n'
+        base64 < "$archive"
+        printf '\nCNE_MAINTENANCE_PAYLOAD_V3\n'
+        printf 'cne_node_main %q %q "$cne_upload"' "$action" "${CNE_ROLES[$idx]}"
+        [[ $# == 0 ]] || printf ' %q' "$@"
+        printf '\n'
+    } > "$script" || return 1
+    cne_send_script "$idx" "$script"; result=$?
+    rm -f "$script"
+    if [[ $result != 0 ]]; then CNE_AUTH_READY[$idx]=0; : > "$CNE_TEMP/auth-failed-$idx"; fi
+    return "$result"
+}
 cne_inspect_all() {
     local idx state role
     CNE_INSPECTIONS=()
@@ -357,13 +405,7 @@ cne_fetch_binary() {
         *) cne_error "不支持的节点架构：$arch"; return 1 ;;
     esac
     archive=$CNE_STATE/cache/wstunnel_11.0.0_linux_$arch.tar.gz
-    [[ ! -L $archive ]] || return 1
-    if [[ ! -f $archive ]] || [[ $(sha256sum "$archive" | awk '{print $1}') != "$checksum" ]]; then
-        cne_note "下载传输组件（$arch）…"
-        curl -fL --retry 2 --connect-timeout 15 --max-time 180 "https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_$arch.tar.gz" -o "$CNE_TEMP/download.tar.gz" || return 1
-        [[ $(sha256sum "$CNE_TEMP/download.tar.gz" | awk '{print $1}') == "$checksum" ]] || { cne_error '下载组件校验失败。'; return 1; }
-        mv "$CNE_TEMP/download.tar.gz" "$archive" || return 1
-    fi
+    cne_download_verified "https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_$arch.tar.gz" "$checksum" "$archive" "传输组件（$arch）" || return 1
     dir=$CNE_TEMP/binary-$arch; mkdir -p "$dir" || return 1
     # Only the named, checksum-verified executable is extracted.
     tar -xzf "$archive" -C "$dir" wstunnel || return 1
@@ -378,7 +420,7 @@ cne_transaction_abort() {
         rm -f "$CNE_STATE/active-transaction"
         return
     fi
-    cne_note '安装未完成，正在逆序恢复本次涉及的节点…'
+    cne_note '本次操作未完成，正在逆序恢复涉及的节点…'
     for ((position=${#CNE_TRANSACTION_ATTEMPTED[@]}-1; position>=0; position--)); do
         idx=${CNE_TRANSACTION_ATTEMPTED[$position]}
         if cne_remote "$idx" restore "${CNE_TRANSACTION_BACKUPS[$idx]}" "$CNE_TRANSACTION_ID"; then
@@ -397,24 +439,28 @@ cne_transaction_abort() {
         if [[ -f $directory/previous-deployment ]]; then
             cp "$directory/previous-deployment" "$CNE_STATE/current-deployment" || failures=1
         else rm -f "$CNE_STATE/current-deployment" || failures=1; fi
+        if [[ -f $directory/previous-ports && ! -L $directory/previous-ports ]]; then
+            cp "$directory/previous-ports" "$CNE_STATE/ports" || failures=1
+            read -r CNE_USER_PORT CNE_WSS_PORT < "$CNE_STATE/ports" || failures=1
+        fi
     fi
     CNE_TRANSACTION_ACTIVE=0
     if ((failures)); then
         printf 'rollback-incomplete\n' > "$directory/transaction-status"
-        cne_error "恢复未全部完成；下次安装会先重试恢复。记录：$directory"
+        cne_error "恢复未全部完成；请选择“15. 重试恢复”后再进行其他操作。记录：$directory"
         return 1
     fi
     printf 'rolled-back\n' > "$directory/transaction-status" || return 1
     rm -f "$CNE_STATE/active-transaction" || return 1
-    cne_note '本次涉及的节点和客户端配置已恢复到安装前状态。'
+    cne_note '本次涉及的节点和客户端配置已恢复到操作前状态。'
 }
 
 cne_transaction_recover() {
     local journal=$CNE_STATE/active-transaction id role backup idx line current_nodes previous_nodes
     [[ -e $journal || -L $journal ]] || return 0
-    [[ -f $journal && ! -L $journal && -O $journal ]] || { cne_error '未完成安装记录不安全。'; return 1; }
+    [[ -f $journal && ! -L $journal && -O $journal ]] || { cne_error '未完成操作记录不安全。'; return 1; }
     IFS= read -r id < "$journal" || return 1
-    [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$ ]] || { cne_error '未完成安装编号无效。'; return 1; }
+    [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$ ]] || { cne_error '未完成操作编号无效。'; return 1; }
     CNE_TRANSACTION_DIRECTORY=$CNE_STATE/history/$id
     CNE_TRANSACTION_ID=$id
     [[ -d $CNE_TRANSACTION_DIRECTORY ]] && cne_safe_directory "$CNE_TRANSACTION_DIRECTORY" || return 1
@@ -426,7 +472,7 @@ cne_transaction_recover() {
         return
     fi
     current_nodes=$(cne_nodes_canonical "$CNE_STATE/nodes.tsv") && previous_nodes=$(cne_nodes_canonical "$CNE_TRANSACTION_DIRECTORY/nodes.tsv") || { cne_error '当前节点已改变，或保存的节点格式无效。请恢复该次记录中的节点设置后重试。'; return 1; }
-    [[ $current_nodes == "$previous_nodes" ]] || { cne_error '存在未完成安装，但当前节点已改变。请恢复该次记录中的节点设置后重试，避免恢复到另一台机器。'; return 1; }
+    [[ $current_nodes == "$previous_nodes" ]] || { cne_error '存在未完成操作，但当前节点已改变。请恢复该次记录中的节点设置后重试，避免恢复到另一台机器。'; return 1; }
     CNE_TRANSACTION_BACKUPS=('' '' '')
     while IFS=$'\t' read -r role backup; do
         case $role in hk) idx=0;; sh) idx=1;; exit) idx=2;; *) return 1;; esac
@@ -442,7 +488,7 @@ cne_transaction_recover() {
         done < "$CNE_TRANSACTION_DIRECTORY/attempted.txt"
     fi
     CNE_TRANSACTION_ACTIVE=1
-    cne_note '发现上次中断的安装，先恢复原有配置。'
+    cne_note '发现上次中断的操作，先恢复原有配置。'
     cne_transaction_abort
 }
 
@@ -455,6 +501,14 @@ cne_transaction_begin() {
     printf 'prepared\n' > "$1/transaction-status" || return 1
     printf '%s\n' "$2" > "$CNE_TEMP/active-transaction" && mv "$CNE_TEMP/active-transaction" "$CNE_STATE/active-transaction" || return 1
     CNE_TRANSACTION_ACTIVE=1
+}
+cne_maintenance_commit() {
+    local directory=$1 id=$2
+    [[ $directory == "$CNE_TRANSACTION_DIRECTORY" && $id == "$CNE_TRANSACTION_ID" && $CNE_TRANSACTION_ACTIVE == 1 ]] || return 1
+    printf 'committed\n' > "$directory/transaction-status" || return 1
+    CNE_TRANSACTION_ACTIVE=0
+    rm -f "$CNE_STATE/active-transaction" || cne_note '维护已提交；残留记录将在下次运行时清理。'
+    return 0
 }
 
 cne_transaction_publish() {
@@ -598,6 +652,9 @@ cne_action_all() {
     cne_require_config || return 1
     case $action in start|restart) order=(1 2 0);; stop|uninstall) order=(0 2 1);; esac
     for idx in "${order[@]}"; do cne_authenticate "$idx" || return 1; done
+    if [[ $action == uninstall && ( -e $CNE_STATE/auto-renew || -L $CNE_STATE/auto-renew ) ]]; then
+        cne_renew_timer_disable || return 1
+    fi
     for idx in "${order[@]}"; do
         printf '\n%s · %s\n' "${CNE_LABELS[$idx]}" "$(cne_display_host "$idx")"
         if [[ $action == uninstall ]]; then cne_remote "$idx" uninstall confirm || result=1
@@ -922,7 +979,8 @@ cne_menu() {
         printf '  5. 启动服务\n  6. 停止服务\n  7. 重启服务\n  8. 查看日志\n  9. 备份配置\n\n'
         printf '  10. 客户端列表\n  11. 添加客户端\n  12. 显示配置与二维码\n  13. 撤销客户端\n\n'
         printf '  14. 卸载服务\n'
-        [[ ! -e $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成安装\n'
+        [[ ! -e $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成操作\n'
+        printf '  16. 恢复历史备份\n  17. 证书续期与自动维护\n  18. 配置下载来源\n  19. 组件离线包\n'
         printf '  0. 退出\n\n'
         cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
         case $choice in
@@ -935,7 +993,7 @@ cne_menu() {
             6) cne_action_all stop || cne_note '部分节点停止失败。';;
             7) cne_action_all restart || cne_note '部分节点重启失败。';;
             8) cne_action_all logs || cne_note '部分日志读取失败。';;
-            9) cne_action_all backup || cne_note '部分备份失败。';;
+            9) cne_backup_create || cne_note '备份未完成，具体原因见上方。';;
             10) cne_clients_list || cne_note '客户端列表读取失败。';;
             11) cne_client_add || cne_note '客户端添加未完成。';;
             12) cne_client_export || cne_note '配置导出未完成。';;
@@ -945,18 +1003,25 @@ cne_menu() {
                 cne_prompt '确认卸载请输入 UNINSTALL' || return 0
                 [[ $CNE_ANSWER != UNINSTALL ]] || cne_action_all uninstall || cne_note '部分节点卸载未完成。';;
             15) cne_require_config && cne_transaction_recover || cne_note '恢复尚未完成，原备份和记录已保留。';;
+            16) cne_backup_restore || cne_note '恢复未完成，备份和记录已保留。';;
+            17) cne_renew_menu || cne_note '证书维护未完成，具体原因见上方。';;
+            18) cne_download_setup || cne_note '下载来源设置未完成。';;
+            19) cne_download_bundle_menu || cne_note '组件离线包操作未完成。';;
             *) cne_note '请输入菜单中的编号。';;
         esac
     done
 }
 cne_main() {
+    CNE_RUNNING_SCRIPT=${BASH_SOURCE[0]}
     case ${1:-menu} in
-        --help|-h) printf '一键安装与管理（纯 Bash）\n用法：bash cn-egress-oneclick.sh [menu|install|status|doctor]\n支持 Debian 12+、Ubuntu 22.04+，无需 Python。\n'; return 0 ;;
+        --help|-h) printf '一键安装与管理（纯 Bash）\n用法：bash cn-egress-oneclick.sh [menu|install|status|doctor|backup|renew|renew-auto]\n支持 Debian 12+、Ubuntu 22.04+，无需 Python。\n'; return 0 ;;
         --version) printf '%s\n' "$CNE_VERSION"; return 0 ;;
-        menu|install|status|doctor) ;;
+        menu|install|status|doctor|backup|renew) ;;
+        renew-auto) CNE_NONINTERACTIVE=1 ;;
         *) cne_error '未知命令，可用 --help 查看用法。'; return 1 ;;
     esac
     cne_bootstrap ui || return 1
-    cne_initialize || return 1
-    case ${1:-menu} in menu) cne_menu;; install) cne_install;; status) cne_status;; doctor) cne_action_all doctor;; esac
+    cne_initialize || return $?
+    cne_download_load || cne_note '下载设置无效；状态和离线配置仍可查看，请通过“18. 配置下载来源”修正。'
+    case ${1:-menu} in menu) cne_menu;; install) cne_install;; status) cne_status;; doctor) cne_action_all doctor;; backup) cne_backup_create;; renew) cne_renew_certificates;; renew-auto) cne_renew_auto || return 1;; esac
 }

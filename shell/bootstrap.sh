@@ -30,6 +30,7 @@ cne_bootstrap() {
         ui) requirements=('flock:util-linux') ;;
         ssh) requirements=('ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux') ;;
         client) requirements=('wg:wireguard-tools' 'ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux' 'sha256sum:coreutils') ;;
+        maintenance) requirements=('ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux' 'openssl:openssl' 'tar:tar' 'gzip:gzip' 'base64:coreutils' 'sha256sum:coreutils') ;;
         all|install)
             requirements=('ssh:openssh-client' 'sshpass:sshpass' 'openssl:openssl' 'curl:curl' 'wg:wireguard-tools' 'flock:util-linux' 'tar:tar' 'base64:coreutils' 'sha256sum:coreutils' 'gzip:gzip' 'timeout:coreutils') ;;
         *) cne_error "未知的依赖准备类型：$mode"; return 1 ;;
@@ -48,6 +49,7 @@ cne_bootstrap() {
         [[ $installed == 'install ok installed' ]] || packages+=(ca-certificates)
     fi
     [[ ${#packages[@]} -gt 0 ]] || return 0
+    [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error "自动维护缺少依赖：${packages[*]}。请手动运行脚本补齐依赖。"; return 1; }
     audit=$(LC_ALL=C dpkg --audit 2>&1) || {
         cne_error '无法检查系统软件包状态，依赖安装已停止。'
         [[ -z $audit ]] || printf '%s\n' "$audit" >&2

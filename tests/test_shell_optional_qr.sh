@@ -16,6 +16,7 @@ assert_absent() { if grep -Eq -- "$2" "$1"; then fail "unexpected output/call: $
 
 mock_setup() {
     source "$ROOT/shell/controller.sh"
+    source "$ROOT/shell/download.sh"
     source "$ROOT/shell/bootstrap.sh"
     CNE_STATE=$WORK/$1
     CNE_TEMP=$CNE_STATE/session

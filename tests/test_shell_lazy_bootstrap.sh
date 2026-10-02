@@ -8,6 +8,7 @@ umask 077
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 source "$ROOT/shell/controller.sh"
+source "$ROOT/shell/download.sh"
 source "$ROOT/shell/bootstrap.sh"
 CNE_STATE=$WORK/state
 CNE_TEMP=$CNE_STATE/session
@@ -55,6 +56,15 @@ grep -Fq '离线查看不连接服务器，也不安装依赖' "$WORK/output" ||
 [[ ! -s $TRACE ]] || fail 'offline menu accessed package state or prepared unrelated prerequisites'
 if grep -Eq '操作未完成|配置导出未完成' "$WORK/output"; then fail 'offline export was reported as a failed action'; fi
 printf 'PASS: real menu exports a saved profile despite missing VPN/SSH tools, missing CA package and broken dpkg\n'
+printf 'unrecognized\tsetting\n' > "$CNE_STATE/downloads.tsv"
+cne_main menu <<<'12
+phone
+2
+0' > "$WORK/invalid-downloads" 2>&1 || fail 'invalid download settings blocked offline management'
+grep -Fq 'PrivateKey = offline-fixture-private-key' "$WORK/invalid-downloads" || fail 'invalid download settings blocked saved profile display'
+grep -Fq '18. 配置下载来源' "$WORK/invalid-downloads" || fail 'invalid download settings did not identify the repair entry'
+[[ ! -s $TRACE ]] || fail 'invalid download settings prepared unrelated dependencies'
+printf 'PASS: malformed download settings leave offline management and the repair menu accessible\n'
 CNE_AUTH_READY[0]=1
 if cne_authenticate 0 > "$WORK/auth-output" 2>&1; then fail 'missing SSH key was accepted from the authentication cache'; fi
 [[ ${CNE_AUTH_READY[0]} == 0 && ! -s $TRACE ]] || fail 'missing SSH key prepared packages or kept cached authentication'

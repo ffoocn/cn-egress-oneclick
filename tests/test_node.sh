@@ -26,6 +26,7 @@ ok 'Symlink ancestors are rejected'
 (
     cne_n_exists() { return 0; }
     cne_n_existing_role() { printf 'unknown\n'; }
+    cne_n_safe_path() { :; }
     cne_n_has() { return 1; }
     cne_n_forwarding() { printf '0\n'; }
     result=$(cne_n_inspect)

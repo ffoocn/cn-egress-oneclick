@@ -136,7 +136,7 @@ cne_n_user_transport() {
     printf '%s\n' "$transport"
 }
 cne_n_inspect() {
-    local state=absent role version=unknown service=inactive wan='' user_port='' user_transport
+    local state=absent role version=unknown service=inactive wan='' user_port='' user_transport deployment=none
     cne_n_exists && state=present
     role=$(cne_n_existing_role) || return 1
     if [[ -f /etc/cn-egress/version ]]; then read -r version < /etc/cn-egress/version; [[ $version =~ ^[a-zA-Z0-9._-]+$ ]] || version=unknown; fi
@@ -147,7 +147,9 @@ cne_n_inspect() {
         [[ $user_port =~ ^[0-9]{1,5}$ ]] && ((user_port>=1 && user_port<=65535)) || user_port=''
     fi
     user_transport=$(cne_n_user_transport) || user_transport=unknown
-    printf 'state=%s\nrole=%s\narch=%s\nwan=%s\nforwarding=%s\nservice=%s\nversion=%s\nuser_port=%s\nuser_transport=%s\n' "$state" "$role" "$(uname -m)" "$wan" "$(cne_n_forwarding)" "$service" "$version" "$user_port" "$user_transport"
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    if [[ -f /etc/cn-egress/deployment-id ]]; then deployment=$(cat /etc/cn-egress/deployment-id); [[ $deployment =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || deployment=unknown; fi
+    printf 'state=%s\nrole=%s\narch=%s\nwan=%s\nforwarding=%s\nservice=%s\nversion=%s\nuser_port=%s\nuser_transport=%s\ndeployment=%s\n' "$state" "$role" "$(uname -m)" "$wan" "$(cne_n_forwarding)" "$service" "$version" "$user_port" "$user_transport" "$deployment"
 }
 cne_n_os_check() {
     [[ $(id -u) == 0 ]] || { cne_n_error '需要 root 权限。'; return 1; }
@@ -252,6 +254,25 @@ cne_n_unit_scope_check() {
         done
     done
 }
+cne_n_kernel_fallback() {
+    local name=$1 kind details flags addresses routes
+    case $name in
+        tunl0) kind=ipip;; gre0) kind=gre;; gretap0) kind=gretap;; erspan0) kind=erspan;;
+        ip_vti0) kind=vti;; ip6_vti0) kind=vti6;; sit0) kind=sit;; ip6tnl0) kind=ip6tnl;; ip6gre0) kind=ip6gre;;
+        *) return 1;;
+    esac
+    details=$(ip -n cn-egress-relay -o -d link show dev "$name" 2>/dev/null) || return 1
+    [[ $details == *' state DOWN '* && $details != *' master '* && $details != *' alias '* ]] || return 1
+    flags=${details#*<}; [[ $flags != "$details" ]] || return 1; flags=${flags%%>*}
+    [[ ,$flags, != *,UP,* && ,$flags, != *,LOWER_UP,* ]] || return 1
+    grep -Eq "[[:space:]]$kind([[:space:]]+(any|ip6ip|ip6ip6))?[[:space:]]+remote[[:space:]]+any[[:space:]]+local[[:space:]]+any([[:space:]]|$)" <<< "$details" || return 1
+    addresses=$(ip -n cn-egress-relay -o address show dev "$name" 2>/dev/null) || return 1
+    [[ -z $addresses ]] || return 1
+    routes=$(ip -n cn-egress-relay -4 route show table all dev "$name" 2>/dev/null) || return 1
+    [[ -z $routes ]] || return 1
+    routes=$(ip -n cn-egress-relay -6 route show table all dev "$name" 2>/dev/null) || return 1
+    [[ -z $routes ]]
+}
 cne_n_scope_check() {
     local file name type links role
     while IFS= read -r file; do cne_n_safe_path "/$file" || return 1; done < <(cne_n_all_files)
@@ -261,7 +282,7 @@ cne_n_scope_check() {
         if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx cn-egress-relay; then
             links=$(ip -n cn-egress-relay -o link show 2>/dev/null) || { cne_n_error '无法确认预留网络命名空间的归属。'; return 1; }
             while IFS= read -r name; do
-                case "$name" in lo|cne-users|cne-cn|cne-exit) :;; *) cne_n_error "cn-egress-relay 内含其他网卡 $name，不能覆盖。"; return 1;; esac
+                case "$name" in lo|cne-users|cne-cn|cne-exit) :;; *) cne_n_kernel_fallback "$name" || { cne_n_error "cn-egress-relay 内含其他网卡 ${name}，不能覆盖。"; return 1; };; esac
             done < <(printf '%s\n' "$links" | awk -F': ' '{split($2,a,"@");print a[1]}')
         fi
         for name in cne-users cne-cn cne-exit; do
@@ -472,16 +493,22 @@ cne_n_remove_files() {
     done < <(cne_n_all_files)
 }
 cne_n_validate_backup() {
-    local archive=$1 destination=$2 directory=/root/cn-egress-backups path list verbose count=0 expected node
+    local archive=$1 destination=$2 directory=/root/cn-egress-backups
     [[ $archive == "$directory/"* && ${archive##*/} =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{8}\.tar\.gz$ && ${archive%/*} == "$directory" ]] || { cne_n_error '只能恢复本节点 root 备份目录内的备份。'; return 1; }
     cne_n_safe_path "$archive" || return 1
     [[ -d $directory && -f $archive && ! -L $archive ]] || { cne_n_error '备份不是普通文件。'; return 1; }
     [[ $(stat -c %u "$directory") == 0 && $(stat -c %a "$directory") == 700 && $(stat -c %u "$archive") == 0 && $(stat -c %a "$archive") == 600 && $(stat -c %h "$archive") == 1 ]] || { cne_n_error '备份归属、权限或链接数量不符合要求。'; return 1; }
-    [[ $(stat -c %s "$archive") -le 104857600 ]] || { cne_n_error '备份过大。'; return 1; }
+    cne_n_validate_backup_contents "$archive" "$destination" "${archive##*/}"
+}
+cne_n_validate_backup_contents() {
+    local archive=$1 destination=$2 basename=$3 path list verbose count=0 expected node
+    [[ $basename =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{8}\.tar\.gz$ ]] || { cne_n_error '备份文件名无效。'; return 1; }
+    cne_n_private_upload "$archive" 104857600 || return 1
     list=$(tar -tzf "$archive") && verbose=$(tar -tvzf "$archive") || { cne_n_error '备份无法读取。'; return 1; }
     [[ -n $list && -n $verbose ]] || return 1
     [[ -z $(printf '%s\n' "$list" | sort | uniq -d) ]] || { cne_n_error '备份包含重复路径。'; return 1; }
     if grep -qv '^-' <<< "$verbose"; then cne_n_error '备份仅允许普通文件。'; return 1; fi
+    cne_n_tar_size_check "$verbose" 104857600 || { cne_n_error '备份解压后过大或成员大小无效。'; return 1; }
     while IFS= read -r path; do
         ((count+=1))
         case $path in .cn-egress-backup|.cn-egress-services.tsv) :;; *)
@@ -492,7 +519,7 @@ cne_n_validate_backup() {
     ((count<=60)) || { cne_n_error '备份文件数量异常。'; return 1; }
     printf '%s\n' "$list" | grep -Fxq .cn-egress-backup && printf '%s\n' "$list" | grep -Fxq .cn-egress-services.tsv || { cne_n_error '备份缺少来源和服务状态。'; return 1; }
     node=$(cne_n_backup_node_id) || return 1
-    expected=$(printf 'format=cn-egress-node-backup-v1\narchive=%s\nnode=%s\n' "${archive##*/}" "$node")
+    expected=$(printf 'format=cn-egress-node-backup-v1\narchive=%s\nnode=%s\n' "$basename" "$node")
     [[ $(tar -xOzf "$archive" .cn-egress-backup) == "$expected" ]] || { cne_n_error '备份来源与本节点不匹配。'; return 1; }
     # Validate before extraction, stopping path/link attacks before any mutation.
     tar -xzf "$archive" --no-same-owner -C "$destination" || return 1
@@ -508,7 +535,8 @@ cne_n_validate_backup() {
     fi
 }
 cne_n_restore_apply() {
-    local temporary=$1 file unit state enabled failures=0 marker
+    local temporary=$1 override_id=${2:-} file unit state enabled failures=0 marker
+    [[ -z $override_id || $override_id =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '恢复操作编号无效。'; return 1; }
     cne_n_stop_owned || return 1
     for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
         [[ ! -f /etc/systemd/system/$unit ]] || systemctl disable "$unit" >&2 || failures=1
@@ -524,6 +552,14 @@ cne_n_restore_apply() {
             cne_n_safe_path "/$file" && mkdir -p "/${file%/*}" && cp -p "$temporary/$file" "/$file" || failures=1
         fi
     done < <(cne_n_all_files)
+    # Extraction intentionally assigns ownership to root. Re-establish the
+    # dedicated transport group used by generated unprivileged WSS units.
+    if [[ -f /etc/systemd/system/cn-egress-obfs.service ]] && grep -Eq '^[[:space:]]*User[[:space:]]*=[[:space:]]*cn-egress-wss[[:space:]]*$' /etc/systemd/system/cn-egress-obfs.service; then
+        cne_n_transport_user || failures=1
+        while IFS= read -r file; do
+            case $file in etc/cn-egress-wss/*) [[ ! -f /$file ]] || chown root:cn-egress-wss "/$file" || failures=1;; esac
+        done < <(cne_n_all_files)
+    fi
     systemctl daemon-reload >&2 || failures=1
     cne_n_scope_check || { cne_n_error '恢复后的服务归属检查未通过，未启动服务。'; return 1; }
     while IFS=$'\t' read -r unit state enabled; do
@@ -534,8 +570,24 @@ cne_n_restore_apply() {
         [[ -f /etc/systemd/system/$unit ]] || continue
         if awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv"; then systemctl start "$unit" >&2 || failures=1; fi
     done
+    # Starting the main unit also starts Wants/Requires dependencies. Enforce
+    # archived stopped states after these implicit starts, particularly obfs.
+    for unit in cn-egress-dns.service cn-egress-obfs.service cn-egress.service cn-egress-users.service; do
+        [[ -f /etc/systemd/system/$unit ]] || continue
+        if ! awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv" && systemctl is-active --quiet "$unit"; then
+            systemctl stop "$unit" >&2 || failures=1
+        fi
+    done
+    for unit in cn-egress-users.service cn-egress.service cn-egress-obfs.service cn-egress-dns.service; do
+        [[ -f /etc/systemd/system/$unit ]] || continue
+        if awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv"; then
+            systemctl is-active --quiet "$unit" || failures=1
+        fi
+    done
     ((failures==0)) || { cne_n_error '恢复未完全成功，请保留备份并检查本工具服务。'; return 1; }
-    if [[ -f $temporary/etc/cn-egress/deployment-id ]]; then
+    if [[ -n $override_id ]]; then
+        cne_n_deployment_mark "$override_id" || return 1
+    elif [[ -f $temporary/etc/cn-egress/deployment-id ]]; then
         mkdir -p /etc/cn-egress || return 1
         marker=$(mktemp /etc/cn-egress/.deployment.XXXXXXXX) || return 1
         if ! cp "$temporary/etc/cn-egress/deployment-id" "$marker" || ! chmod 600 "$marker" || ! mv "$marker" /etc/cn-egress/deployment-id; then rm -f "$marker"; return 1; fi
@@ -567,6 +619,230 @@ cne_n_restore() {
 }
 cne_n_rollback() {
     cne_n_restore "$1"
+}
+cne_n_private_upload() {
+    local file=$1 maximum=$2 size
+    cne_n_safe_path "$file" || return 1
+    [[ -f $file && ! -L $file && $(stat -c %u "$file") == 0 && $(stat -c %a "$file") == 600 && $(stat -c %h "$file") == 1 ]] || { cne_n_error '上传文件必须是 root 私有普通文件，不能包含链接。'; return 1; }
+    size=$(stat -c %s "$file") || return 1
+    [[ $size =~ ^[0-9]+$ ]] && ((size>0 && size<=maximum)) || { cne_n_error '上传文件为空或过大。'; return 1; }
+}
+cne_n_tar_size_check() {
+    # GNU tar uses mode,owner/group,size; BSD tar additionally prints a link
+    # count and separate owner/group columns. Both list ordinary files here.
+    LC_ALL=C awk -v maximum="$2" '{size=$3;if($2~/^[0-9]+$/ && $5~/^[0-9]+$/)size=$5;if(size!~/^[0-9]+$/)bad=1;total+=size}END{exit bad || total>maximum}' <<< "$1"
+}
+cne_n_deployment_read() {
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    if [[ ! -f /etc/cn-egress/deployment-id ]]; then printf 'none\n'; return; fi
+    local deployment
+    deployment=$(cat /etc/cn-egress/deployment-id) || return 1
+    [[ $deployment =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '现有部署编号无效。'; return 1; }
+    printf '%s\n' "$deployment"
+}
+cne_n_deployment_mark() {
+    local operation=$1 marker
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '维护操作编号无效。'; return 1; }
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    mkdir -p /etc/cn-egress || return 1
+    marker=$(mktemp /etc/cn-egress/.deployment.XXXXXXXX) || return 1
+    if ! printf '%s\n' "$operation" > "$marker" || ! chmod 600 "$marker" || ! mv "$marker" /etc/cn-egress/deployment-id; then rm -f "$marker"; return 1; fi
+}
+cne_n_maintenance_guard() {
+    local role=$1 expected=$2 absent=${3:-} current unit transport
+    [[ $expected == none || $expected =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '预期部署编号无效。'; return 1; }
+    cne_n_scope_check || return 1
+    if cne_n_exists; then
+        cne_n_require_role "$role" || { cne_n_error '维护要求本节点已有同角色的本工具部署。'; return 1; }
+        [[ -f /etc/cn-egress/role && -f /etc/cn-egress-wss/role ]] || { cne_n_error '节点部署不完整，不能进行维护，请先修复安装。'; return 1; }
+        transport=$(cne_n_user_transport) || return 1
+        for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
+            [[ $unit != cn-egress-dns.service || $role == exit ]] || continue
+            [[ $unit != cn-egress-users.service || ( $role == hk && $transport == awg2 ) ]] || continue
+            [[ -f /etc/systemd/system/$unit ]] || { cne_n_error "节点部署缺少服务 ${unit}，请先修复安装。"; return 1; }
+        done
+    elif [[ $absent != allow-absent || $expected != none ]]; then
+        cne_n_error '维护要求本节点已有同角色的本工具部署。'; return 1
+    fi
+    current=$(cne_n_deployment_read) || return 1
+    [[ $current == "$expected" ]] || { cne_n_error '节点部署已改变，请重新检查后再操作。'; return 1; }
+}
+cne_n_config_records() {
+    local mode=${1:-config} file hash
+    while IFS= read -r file; do
+        case $file in
+            etc/cn-egress/deployment-id) continue;;
+            etc/cn-egress-wss/ca.crt|etc/cn-egress-wss/node.crt|etc/cn-egress-wss/node.key) [[ $mode == tls ]] || continue;;
+            *) [[ $mode != tls ]] || continue;;
+        esac
+        cne_n_safe_path "/$file" || return 1
+        if [[ -f /$file ]]; then
+            hash=$(sha256sum "/$file") || return 1
+            printf '%s\t%s\n' "$file" "${hash%% *}"
+        else printf '%s\tabsent\n' "$file"; fi
+    done < <(cne_n_all_files)
+}
+cne_n_config_fingerprint() {
+    local mode=${1:-config} records
+    records=$(cne_n_config_records "$mode") || return 1
+    printf '%s\n' "$records" | sha256sum | awk '{print $1}'
+}
+cne_n_maintenance_info() {
+    local role=$1 state=absent actual=unknown deployment=none ca=none host=none config tls unit label active enabled cert_due=1 ca_due=1
+    cne_n_scope_check || return 1
+    if cne_n_exists; then
+        state=present; actual=$(cne_n_existing_role) || return 1
+        [[ $actual == "$role" ]] || { cne_n_error '节点角色与维护配置不符。'; return 1; }
+        deployment=$(cne_n_deployment_read) || return 1
+    fi
+    cne_n_safe_path /etc/cn-egress-wss/ca.crt && cne_n_safe_path /etc/cn-egress-wss/sh-host || return 1
+    if [[ -f /etc/cn-egress-wss/ca.crt ]]; then ca=$(sha256sum /etc/cn-egress-wss/ca.crt) || return 1; ca=${ca%% *}; fi
+    if [[ -f /etc/cn-egress-wss/sh-host ]]; then
+        host=$(cat /etc/cn-egress-wss/sh-host) || return 1
+        [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ${#host} -le 253 ]] || { cne_n_error '现有传输主机地址无效。'; return 1; }
+    fi
+    config=$(cne_n_config_fingerprint config) && tls=$(cne_n_config_fingerprint tls) || return 1
+    cne_n_safe_path /etc/cn-egress-wss/node.crt || return 1
+    openssl x509 -in /etc/cn-egress-wss/node.crt -noout -checkend 2592000 >/dev/null 2>&1 && cert_due=0
+    openssl x509 -in /etc/cn-egress-wss/ca.crt -noout -checkend 2592000 >/dev/null 2>&1 && ca_due=0
+    printf 'state=%s\nrole=%s\ndeployment=%s\nca_sha256=%s\nconfig_sha256=%s\ntls_sha256=%s\nwss_host=%s\ncert_due=%s\nca_due=%s\n' "$state" "$actual" "$deployment" "$ca" "$config" "$tls" "$host" "$cert_due" "$ca_due"
+    for label in main obfs dns users; do
+        case $label in main) unit=cn-egress.service;; *) unit="cn-egress-$label.service";; esac
+        active=$(systemctl is-active "$unit" 2>/dev/null) || :
+        enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || :
+        [[ $active =~ ^(active|inactive|failed|activating|deactivating|reloading|maintenance|refreshing|unknown)$ ]] || active=inactive
+        [[ $enabled =~ ^(enabled|enabled-runtime|disabled|static|indirect|generated|masked|masked-runtime|transient|linked|linked-runtime|alias|bad|not-found|unknown)$ ]] || enabled=not-found
+        printf '%s_active=%s\n%s_enabled=%s\n' "$label" "$active" "$label" "$enabled"
+    done
+}
+cne_n_backup_export() {
+    local role=$1 archive=$2 stage
+    cne_n_scope_check && cne_n_backup_directory || return 1
+    stage=$(mktemp -d /root/cn-egress-backups/.export.XXXXXXXX) || return 1
+    if ! cne_n_validate_backup "$archive" "$stage"; then rm -rf "$stage"; return 1; fi
+    if [[ -f $stage/etc/cn-egress/role && $(cat "$stage/etc/cn-egress/role") != "$role" ]]; then rm -rf "$stage"; cne_n_error '备份节点角色与请求不符。'; return 1; fi
+    rm -rf "$stage"
+    base64 < "$archive"
+}
+cne_n_restore_target_check() (
+    local stage=$1 role=$2 unit file content transport=wireguard wan mode
+    [[ -f $stage/etc/cn-egress/role && $(cat "$stage/etc/cn-egress/role") == "$role" && -f $stage/etc/cn-egress-wss/role && $(cat "$stage/etc/cn-egress-wss/role") == "$role" ]] || { cne_n_error '历史恢复需要同角色的完整部署备份，不能恢复为空节点。'; exit 1; }
+    if [[ -f $stage/etc/cn-egress/user-transport ]]; then transport=$(cat "$stage/etc/cn-egress/user-transport"); fi
+    [[ $transport == wireguard || ( $role == hk && $transport == awg2 ) ]] || { cne_n_error '备份客户端传输类型无效。'; exit 1; }
+    cne_n_user_transport() { printf '%s\n' "$transport"; }
+    while IFS= read -r file; do
+        [[ -f $stage/$file ]] || continue
+        mode=$(stat -c %a "$stage/$file") || exit 1
+        [[ $(stat -c %u "$stage/$file") == 0 && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022)==0 )) || { cne_n_error "历史备份文件可被其他用户修改：$file"; exit 1; }
+    done < <(cne_n_all_files)
+    for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
+        file="$stage/etc/systemd/system/$unit"
+        if [[ -f $file ]]; then cne_n_unit_file_check "$file" "$unit" "$role" || exit 1
+        elif [[ $unit == cn-egress.service || $unit == cn-egress-obfs.service || ( $unit == cn-egress-dns.service && $role == exit ) || ( $unit == cn-egress-users.service && $role == hk && $transport == awg2 ) ]]; then
+            cne_n_error "历史备份服务缺失：$unit"; exit 1
+        fi
+    done
+    for file in obfs.conf users.conf; do
+        [[ -f $stage/etc/systemd/system/cn-egress.service.d/$file ]] || continue
+        content=$(sed -E '/^[[:space:]]*([#;]|$)/d; s/^[[:space:]]+//; s/[[:space:]]+$//' "$stage/etc/systemd/system/cn-egress.service.d/$file") || exit 1
+        case $file in
+            obfs.conf) [[ $content == $'[Unit]\nWants=cn-egress-obfs.service\nAfter=cn-egress-obfs.service' ]] || exit 1;;
+            users.conf) [[ $role == hk && $transport == awg2 && ( $content == $'[Unit]\nRequires=cn-egress-users.service\nBindsTo=cn-egress-users.service\nAfter=cn-egress-users.service' || $content == $'[Unit]\nRequires=cn-egress-users.service\nAfter=cn-egress-users.service' ) ]] || exit 1;;
+        esac
+    done
+    if [[ $role == exit ]]; then
+        [[ -f $stage/etc/cn-egress/wan-interface ]] || { cne_n_error '出口备份缺少上联网卡。'; exit 1; }
+        wan=$(cne_n_wan) || exit 1
+        [[ -n $wan && $(cat "$stage/etc/cn-egress/wan-interface") == "$wan" ]] || { cne_n_error '出口上联网卡已改变，不能直接恢复该备份。'; exit 1; }
+    fi
+)
+cne_n_restore_import() {
+    local role=$1 upload=$2 basename=$3 expected=$4 operation=$5 stage archive incoming
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '恢复操作编号无效。'; return 1; }
+    cne_n_maintenance_guard "$role" "$expected" allow-absent && cne_n_private_upload "$upload" 104857600 || return 1
+    cne_n_backup_directory || return 1
+    stage=$(mktemp -d /root/cn-egress-backups/.import.XXXXXXXX) || return 1
+    if ! cne_n_validate_backup_contents "$upload" "$stage" "$basename" || ! cne_n_restore_target_check "$stage" "$role"; then rm -rf "$stage"; return 1; fi
+    archive="/root/cn-egress-backups/$basename"
+    cne_n_safe_path "$archive" || { rm -rf "$stage"; return 1; }
+    if [[ -f $archive ]]; then
+        if ! cne_n_private_upload "$archive" 104857600 || ! cmp -s "$upload" "$archive"; then rm -rf "$stage"; cne_n_error '本节点已有同名但内容不同的备份，已停止。'; return 1; fi
+    else
+        incoming=$(mktemp /root/cn-egress-backups/.incoming.XXXXXXXX) || { rm -rf "$stage"; return 1; }
+        if ! cp "$upload" "$incoming" || ! chmod 600 "$incoming" || ! mv "$incoming" "$archive"; then rm -f "$incoming"; rm -rf "$stage"; return 1; fi
+    fi
+    # Re-check identity while still holding the node lock, then keep this operation
+    # identity throughout a partial restore so the manager can undo every node.
+    if ! cne_n_maintenance_guard "$role" "$expected" allow-absent || ! cne_n_deployment_mark "$operation"; then rm -rf "$stage"; return 1; fi
+    if ! cne_n_restore_apply "$stage" "$operation"; then rm -rf "$stage"; return 1; fi
+    rm -rf "$stage"
+    printf '历史备份已恢复。\n'
+}
+cne_n_certificate_validate() {
+    local role=$1 archive=$2 stage=$3 list verbose host purpose usage key_public cert_public ca_public subject
+    cne_n_private_upload "$archive" 65536 || return 1
+    list=$(tar -tzf "$archive") && verbose=$(tar -tvzf "$archive") || { cne_n_error '证书更新包无法读取。'; return 1; }
+    [[ $(printf '%s\n' "$list" | LC_ALL=C sort) == $'ca.crt\nnode.crt\nnode.key' ]] && ! grep -qv '^-' <<< "$verbose" || { cne_n_error '证书更新包只允许 ca.crt、node.crt、node.key 三个普通文件。'; return 1; }
+    cne_n_tar_size_check "$verbose" 65536 || { cne_n_error '证书更新包解压后过大。'; return 1; }
+    tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$stage" || return 1
+    for subject in ca.crt node.crt; do
+        [[ $(awk '/-----BEGIN CERTIFICATE-----/{n++}END{print n+0}' "$stage/$subject") == 1 ]] && ! grep -q 'PRIVATE KEY' "$stage/$subject" && openssl x509 -in "$stage/$subject" -noout -checkend 2592000 >/dev/null 2>&1 || { cne_n_error '证书无效、包含私钥或将在 30 天内到期。'; return 1; }
+    done
+    subject=$(openssl x509 -in "$stage/ca.crt" -noout -ext basicConstraints 2>/dev/null) || return 1
+    [[ $subject == *'CA:TRUE'* ]] || { cne_n_error '更新包中的 CA 不是有效 CA 证书。'; return 1; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -ext basicConstraints 2>/dev/null) || return 1
+    [[ $subject == *'CA:FALSE'* ]] || { cne_n_error '节点证书不能作为 CA 使用。'; return 1; }
+    key_public=$(openssl pkey -in "$stage/node.key" -passin pass: -pubout 2>/dev/null) || { cne_n_error '节点私钥无效，不能使用加密或损坏的私钥。'; return 1; }
+    cert_public=$(openssl x509 -in "$stage/node.crt" -pubkey -noout 2>/dev/null) || return 1
+    [[ $key_public == "$cert_public" ]] || { cne_n_error '证书与节点私钥不匹配。'; return 1; }
+    ca_public=$(openssl x509 -in "$stage/ca.crt" -pubkey -noout 2>/dev/null) || return 1
+    [[ $key_public != "$ca_public" ]] || { cne_n_error '节点私钥不能与 CA 私钥相同。'; return 1; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
+    [[ $subject == "subject=CN=cn-egress-$role" || $subject == "subject= CN=cn-egress-$role" ]] || { cne_n_error '节点证书角色不符。'; return 1; }
+    purpose=sslclient; usage='TLS Web Client Authentication'
+    [[ $role != sh ]] || { purpose=sslserver; usage='TLS Web Server Authentication'; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -ext extendedKeyUsage 2>/dev/null | tail -n +2 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || return 1
+    [[ $subject == "$usage" ]] || { cne_n_error '节点证书用途与角色不符。'; return 1; }
+    openssl verify -CAfile "$stage/ca.crt" -check_ss_sig "$stage/ca.crt" >/dev/null 2>&1 && openssl verify -CAfile "$stage/ca.crt" -purpose "$purpose" "$stage/node.crt" >/dev/null 2>&1 || { cne_n_error '证书 CA 或签名链无效。'; return 1; }
+    if [[ $role == sh ]]; then
+        cne_n_safe_path /etc/cn-egress-wss/sh-host || return 1
+        host=$(cat /etc/cn-egress-wss/sh-host) || return 1
+        [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ${#host} -le 253 ]] || return 1
+        if [[ $host =~ ^[0-9.]+$ ]]; then
+            openssl verify -CAfile "$stage/ca.crt" -purpose sslserver -verify_ip "$host" "$stage/node.crt" >/dev/null 2>&1
+        else openssl verify -CAfile "$stage/ca.crt" -purpose sslserver -verify_hostname "$host" "$stage/node.crt" >/dev/null 2>&1; fi || { cne_n_error '大陆中转证书不包含当前传输地址。'; return 1; }
+    fi
+}
+cne_n_certificate_apply() {
+    local role=$1 archive=$2 expected=$3 operation=$4 stage file destination replacement active enabled mode
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '证书更新操作编号无效。'; return 1; }
+    cne_n_maintenance_guard "$role" "$expected" || return 1
+    for file in ca.crt node.crt node.key; do
+        destination="/etc/cn-egress-wss/$file"
+        cne_n_safe_path "$destination" || return 1
+        [[ -f $destination && $(stat -c %u "$destination") == 0 ]] || { cne_n_error '现有证书文件归属无效或缺失。'; return 1; }
+        mode=$(stat -c %a "$destination") || return 1
+        [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022)==0 )) || { cne_n_error '现有证书可被其他用户修改。'; return 1; }
+    done
+    stage=$(mktemp -d /etc/cn-egress-wss/.renew.XXXXXXXX) || return 1
+    if ! cne_n_certificate_validate "$role" "$archive" "$stage"; then rm -rf "$stage"; return 1; fi
+    active=$(systemctl is-active cn-egress-obfs.service 2>/dev/null) || :
+    enabled=$(systemctl is-enabled cn-egress-obfs.service 2>/dev/null) || :
+    [[ $active == active || $active == inactive || $active == failed ]] || { rm -rf "$stage"; cne_n_error '传输服务正在切换状态，请稍后重试。'; return 1; }
+    systemctl daemon-reload >&2 && cne_n_maintenance_guard "$role" "$expected" || { rm -rf "$stage"; return 1; }
+    cne_n_deployment_mark "$operation" || { rm -rf "$stage"; return 1; }
+    if [[ $active == active ]]; then systemctl stop cn-egress-obfs.service >&2 || { rm -rf "$stage"; return 1; }; fi
+    for file in ca.crt node.crt node.key; do
+        destination="/etc/cn-egress-wss/$file"
+        replacement=$(mktemp /etc/cn-egress-wss/.certificate.XXXXXXXX) || { rm -rf "$stage"; return 1; }
+        # Preserve the existing certificate permissions and transport group while
+        # publishing each file atomically. WireGuard/AWG configuration is untouched.
+        if ! cp -p "$destination" "$replacement" || ! cat "$stage/$file" > "$replacement" || ! mv "$replacement" "$destination"; then rm -f "$replacement"; rm -rf "$stage"; return 1; fi
+    done
+    rm -rf "$stage"
+    if [[ $active == active ]]; then systemctl start cn-egress-obfs.service >&2 && systemctl is-active --quiet cn-egress-obfs.service || return 1; fi
+    [[ $(systemctl is-enabled cn-egress-obfs.service 2>/dev/null || :) == "$enabled" ]] || { cne_n_error '传输服务启用状态已改变，更新未完成。'; return 1; }
+    printf '传输证书已更新，设备配置保持不变。\n'
 }
 cne_n_validate_archive() {
     local role=$1 archive=$2 destination=$3 list verbose path number
@@ -679,7 +955,7 @@ cne_n_install_apply() {
     chmod 755 /opt/cn-egress /opt/cn-egress/wstunnel-11.0.0 || return 1
     [[ ! -d /opt/cn-egress/awg-0.2.16 ]] || chmod 755 /opt/cn-egress/awg-0.2.16 || return 1
     printf '%s\n' "$role" > /etc/cn-egress/role || return 1
-    printf '2.1.1\n' > /etc/cn-egress/version || return 1
+    printf '2.2.0\n' > /etc/cn-egress/version || return 1
     chmod 600 /etc/cn-egress/{role,version,deployment-id} || return 1
     systemctl daemon-reload >&2 || return 1
     cne_n_scope_check || return 1
@@ -720,7 +996,7 @@ cne_n_install() {
 cne_n_require_role() {
     local role=$1 actual
     actual=$(cne_n_existing_role) || return 1
-    [[ $actual == "$role" ]] || { cne_n_error "当前节点角色为 $actual，期望 $role。请选择备份后覆盖安装以修复不完整配置。"; return 1; }
+    [[ $actual == "$role" ]] || { cne_n_error "当前节点角色为 ${actual}，期望 ${role}。请选择备份后覆盖安装以修复不完整配置。"; return 1; }
 }
 cne_n_net() { local role=$1; shift; if [[ $role == hk || $role == sh ]]; then ip netns exec cn-egress-relay "$@"; else "$@"; fi; }
 cne_n_status() {
@@ -1074,10 +1350,14 @@ cne_n_dispatch() {
     local action=$1 role=$2; shift 2
     case $action in
         inspect) cne_n_inspect;;
+        maintenance-info) (($#==0)) || return 2; cne_n_maintenance_info "$role";;
         preflight) cne_n_preflight "$role" "$@";;
         prepare) cne_n_prepare "$role" "${1:-wireguard}";;
         backup) cne_n_scope_check && cne_n_backup;;
+        backup-export) (($#==1)) || return 2; cne_n_backup_export "$role" "$@";;
         restore) (($#>=1 && $#<=2)) || return 2; cne_n_restore "$@";;
+        restore-import) (($#==4)) || return 2; cne_n_restore_import "$role" "$@";;
+        certificate-apply) (($#==3)) || return 2; cne_n_certificate_apply "$role" "$@";;
         install) (($#==3)) || return 2; cne_n_install "$role" "$@";;
         status) cne_n_status "$role";;
         doctor) cne_n_doctor "$role";;
@@ -1582,6 +1862,7 @@ cne_bootstrap() {
         ui) requirements=('flock:util-linux') ;;
         ssh) requirements=('ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux') ;;
         client) requirements=('wg:wireguard-tools' 'ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux' 'sha256sum:coreutils') ;;
+        maintenance) requirements=('ssh:openssh-client' 'sshpass:sshpass' 'flock:util-linux' 'openssl:openssl' 'tar:tar' 'gzip:gzip' 'base64:coreutils' 'sha256sum:coreutils') ;;
         all|install)
             requirements=('ssh:openssh-client' 'sshpass:sshpass' 'openssl:openssl' 'curl:curl' 'wg:wireguard-tools' 'flock:util-linux' 'tar:tar' 'base64:coreutils' 'sha256sum:coreutils' 'gzip:gzip' 'timeout:coreutils') ;;
         *) cne_error "未知的依赖准备类型：$mode"; return 1 ;;
@@ -1600,6 +1881,7 @@ cne_bootstrap() {
         [[ $installed == 'install ok installed' ]] || packages+=(ca-certificates)
     fi
     [[ ${#packages[@]} -gt 0 ]] || return 0
+    [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error "自动维护缺少依赖：${packages[*]}。请手动运行脚本补齐依赖。"; return 1; }
     audit=$(LC_ALL=C dpkg --audit 2>&1) || {
         cne_error '无法检查系统软件包状态，依赖安装已停止。'
         [[ -z $audit ]] || printf '%s\n' "$audit" >&2
@@ -1676,6 +1958,369 @@ cne_ensure_qrencode() {
     command -v qrencode >/dev/null 2>&1 || { cne_note '二维码工具暂不可用：安装后仍未找到 qrencode。'; return 1; }
 }
 #!/usr/bin/env bash
+# HTTPS download settings and portable, checksum-verified component caches.
+# Configuration is data only; nothing is sourced or evaluated as Shell code.
+CNE_DOWNLOAD_GITHUB_PREFIX=''
+CNE_DOWNLOAD_GO_BASE=https://go.dev/dl
+CNE_DOWNLOAD_GOPROXY=https://proxy.golang.org
+
+cne_download_https() {
+    [[ ${#1} -le 512 && $1 =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~%/+:-]*)?$ && $1 != *'/../'* && $1 != */.. ]]
+}
+
+cne_download_load() {
+    local file=$CNE_STATE/downloads.tsv key value extra seen=' ' github='' go=https://go.dev/dl proxy=https://proxy.golang.org
+    CNE_DOWNLOAD_GITHUB_PREFIX=''; CNE_DOWNLOAD_GO_BASE=https://go.dev/dl; CNE_DOWNLOAD_GOPROXY=https://proxy.golang.org
+    [[ -e $file || -L $file ]] || return 0
+    [[ -f $file && ! -L $file && -O $file ]] || { cne_error '下载设置文件不安全。'; return 1; }
+    while IFS=$'\t' read -r key value extra; do
+        [[ -z $extra && $seen != *" $key "* ]] || { cne_error '下载设置含重复或无效字段。'; return 1; }
+        seen+="$key "
+        case $key in
+            github_prefix) [[ $value == - ]] || cne_download_https "$value" || return 1; [[ $value != - ]] || value=''; github=$value;;
+            go_base) cne_download_https "$value" || return 1; go=${value%/};;
+            goproxy) cne_download_https "$value" || return 1; proxy=${value%/};;
+            *) cne_error '下载设置含未知字段。'; return 1;;
+        esac
+    done < "$file"
+    [[ $seen == *' github_prefix '* && $seen == *' go_base '* && $seen == *' goproxy '* ]] || { cne_error '下载设置不完整。'; return 1; }
+    CNE_DOWNLOAD_GITHUB_PREFIX=$github; CNE_DOWNLOAD_GO_BASE=$go; CNE_DOWNLOAD_GOPROXY=$proxy
+}
+
+cne_download_setup() {
+    local file=$CNE_STATE/downloads.tsv github go proxy temporary default
+    [[ ! -L $file && ( ! -e $file || -f $file && -O $file ) ]] || { cne_error '下载设置文件不安全。'; return 1; }
+    cne_download_load || cne_note '原下载设置无效，下面按默认值重新填写。'
+    printf '\n下载来源设置\n只接受 HTTPS 地址；所有组件仍核对固定 SHA-256，Go 仍核对 go.sum。输入 0 可取消。\n'
+    default=${CNE_DOWNLOAD_GITHUB_PREFIX:--}
+    while :; do
+        cne_prompt 'GitHub/codeload 镜像前缀（- 使用官方来源）' "$default" || return 1
+        github=$CNE_ANSWER
+        [[ $github != 0 ]] || { printf '已取消。\n'; return 0; }
+        [[ $github == - ]] || cne_download_https "$github" || { cne_note '请填写 HTTPS 镜像前缀或 -；不要包含用户名、密码或查询参数。'; continue; }
+        break
+    done
+    while :; do cne_prompt 'Go 工具链下载目录' "$CNE_DOWNLOAD_GO_BASE" || return 1; go=$CNE_ANSWER; [[ $go != 0 ]] || { printf '已取消。\n'; return 0; }; cne_download_https "$go" && break; cne_note '请填写 HTTPS 下载目录，文件名会自动附加。'; done
+    while :; do cne_prompt 'Go 模块 GOPROXY' "$CNE_DOWNLOAD_GOPROXY" || return 1; proxy=$CNE_ANSWER; [[ $proxy != 0 ]] || { printf '已取消。\n'; return 0; }; cne_download_https "$proxy" && break; cne_note '请填写单个 HTTPS Go 模块代理地址。'; done
+    temporary=$(mktemp "$CNE_TEMP/download-settings.XXXXXXXX") || return 1
+    printf 'github_prefix\t%s\ngo_base\t%s\ngoproxy\t%s\n' "$github" "${go%/}" "${proxy%/}" > "$temporary" && chmod 600 "$temporary" && mv "$temporary" "$file" || return 1
+    cne_download_load || return 1
+    printf '下载设置已保存。镜像前缀会放在原 GitHub/codeload URL 前；不改变组件校验值。\n'
+}
+
+cne_download_url() {
+    local url=$1
+    case $url in
+        https://github.com/*|https://codeload.github.com/*)
+            [[ -z $CNE_DOWNLOAD_GITHUB_PREFIX ]] || url=${CNE_DOWNLOAD_GITHUB_PREFIX%/}/$url;;
+        https://go.dev/dl/*) url=${CNE_DOWNLOAD_GO_BASE%/}/${url#https://go.dev/dl/};;
+    esac
+    printf '%s\n' "$url"
+}
+
+cne_download_verified() {
+    local official=$1 expected=$2 archive=$3 label=${4:-组件} actual url temporary
+    [[ $expected =~ ^[0-9a-f]{64}$ && ! -L $archive && ( ! -e $archive || -f $archive && -O $archive ) ]] || { cne_error '组件校验参数或缓存文件无效。'; return 1; }
+    cne_safe_directory "${archive%/*}" || return 1
+    if [[ -f $archive ]]; then
+        actual=$(sha256sum "$archive" | awk '{print $1}') || return 1
+        [[ $actual != "$expected" ]] || return 0
+    fi
+    cne_download_load || return 1
+    url=$(cne_download_url "$official") || return 1
+    temporary=$(mktemp "$CNE_TEMP/component-download.XXXXXXXX") || return 1
+    cne_note "下载${label}…"
+    if ! curl -fL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$temporary"; then
+        rm -f "$temporary"
+        cne_error "${label}下载失败：$url。请在菜单 18 设置下载来源，或在菜单 19 导入已校验缓存后重试。"
+        return 1
+    fi
+    actual=$(sha256sum "$temporary" | awk '{print $1}') || { rm -f "$temporary"; return 1; }
+    if [[ $actual != "$expected" ]]; then
+        rm -f "$temporary"
+        cne_error "${label}的 SHA-256 校验失败，未使用下载结果；请检查下载来源。"
+        return 1
+    fi
+    chmod 600 "$temporary" && mv "$temporary" "$archive"
+}
+
+cne_download_component_specs() {
+    cat <<'COMPONENTS'
+go1.24.4.linux-amd64.tar.gz	77e5da33bb72aeaef1ba4418b6fe511bc4d041873cbf82e5aa6318740df98717	https://go.dev/dl/go1.24.4.linux-amd64.tar.gz
+go1.24.4.linux-arm64.tar.gz	d5501ee5aca0f258d5fe9bfaed401958445014495dc115f202d43d5210b45241	https://go.dev/dl/go1.24.4.linux-arm64.tar.gz
+amneziawg-go-730d6c39d0c4e348a3d080bebe496664215e5c99.tar.gz	e26d13e5229f0976353008d78d1359bbdb000c9688b17a1d065ba1f61cbd872a	https://codeload.github.com/amnezia-vpn/amneziawg-go/tar.gz/730d6c39d0c4e348a3d080bebe496664215e5c99
+amneziawg-tools-5d6179a6d0842e98dfb349c28cf1bd8e4b9d1079.tar.gz	e79a3c7f2def315d052a3648b49058a268c4b63cdb5e082b696d2a4a0a2367f0	https://codeload.github.com/amnezia-vpn/amneziawg-tools/tar.gz/5d6179a6d0842e98dfb349c28cf1bd8e4b9d1079
+wstunnel_11.0.0_linux_amd64.tar.gz	9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e	https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz
+wstunnel_11.0.0_linux_arm64.tar.gz	b86abf73e340ed0c3ff9a77a5458aa27213784920ec65513132b36def45edc94	https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_arm64.tar.gz
+COMPONENTS
+}
+
+cne_download_component_sha() {
+    cne_download_component_specs | awk -F'\t' -v name="$1" '$1==name{print $2;found=1}END{exit !found}'
+}
+
+cne_download_size() { wc -c < "$1" | tr -d '[:space:]'; }
+
+# Only artifacts for modules listed in the pinned upstream go.sum can travel.
+# Existing .ziphash files are deliberately excluded: Go must recompute hashes
+# of portable ZIP files before comparing them with the pinned source go.sum.
+cne_download_module_allowlist() {
+    local archive=$1 expected actual member
+    member=amneziawg-go-730d6c39d0c4e348a3d080bebe496664215e5c99/go.sum
+    expected=$(cne_download_component_sha "${archive##*/}") || return 1
+    actual=$(sha256sum "$archive" | awk '{print $1}') || return 1
+    [[ $actual == "$expected" ]] || { cne_error 'Go 模块名单的固定源码校验失败。'; return 1; }
+    tar -xOzf "$archive" "$member" | awk '
+      function escape(v, out,i,c){out="";for(i=1;i<=length(v);i++){c=substr(v,i,1);out=out (c~/[A-Z]/?"!" tolower(c):c)}return out}
+      NF==3&&$3~/^h1:/ {v=$2;sub(/\/go.mod$/,"",v);p=escape($1) "/@v/" escape(v);if(p!~/^[A-Za-z0-9.!_+\/-]+\/@v\/[A-Za-z0-9.!_+-]+$/){bad=1;next};if(!seen[p]++){print p ".mod";print p ".info";print p ".zip"}}
+      END{exit bad?1:0}' | LC_ALL=C sort
+}
+
+cne_download_module_name_ok() {
+    [[ $1 =~ ^[A-Za-z0-9.!_+/-]+/@v/[A-Za-z0-9.!_+-]+\.(mod|info|zip)$ && $1 != /* && $1 != *'../'* && $1 != *'/..'* ]] && grep -Fqx -- "$1" "$2"
+}
+
+cne_download_file_url() {
+    printf 'file://'
+    printf '%s\n' "$1" | sed 's/%/%25/g;s/ /%20/g;s/#/%23/g;s/?/%3F/g'
+}
+
+cne_download_modules_seed() {
+    local work=$1 target=$2 source=$3 cache=$CNE_STATE/cache/gomod-download file relative allowlist ready
+    cne_download_load || return 1
+    CNE_GO_PROXY=$CNE_DOWNLOAD_GOPROXY
+    [[ ${CNE_AWG_REFRESH_MODULE_CACHE:-0} != 1 ]] || return 0
+    [[ -e $cache || -L $cache ]] || return 0
+    cne_safe_directory "$cache" || return 1
+    [[ -z $(find "$cache" -type l -print -quit) ]] || { cne_error 'Go 依赖缓存不能含符号链接。'; return 1; }
+    allowlist=$work/module-allowlist
+    cne_download_module_allowlist "$source" > "$allowlist" || return 1
+    mkdir -p "$work/gomodcache/cache/download" || return 1
+    while IFS= read -r file; do
+        relative=${file#"$cache"/}
+        [[ $relative != .ready.* ]] || continue
+        cne_download_module_name_ok "$relative" "$allowlist" || { cne_error 'Go 缓存包含来源名单之外的文件。'; return 1; }
+        mkdir -p "$work/gomodcache/cache/download/${relative%/*}" && cp "$file" "$work/gomodcache/cache/download/$relative" || return 1
+    done < <(find "$cache" -type f -print | LC_ALL=C sort)
+    ready=$cache/.ready.$target
+    if [[ -f $ready && ! -L $ready ]] && [[ $(cat "$ready") == "730d6c39d0c4e348a3d080bebe496664215e5c99 $target" ]]; then
+        CNE_GO_PROXY=$(cne_download_file_url "$work/gomodcache/cache/download") || return 1
+        cne_note '使用已完成编译的 Go 依赖缓存；本次编译不从模块代理下载。'
+    fi
+}
+
+cne_download_modules_publish() {
+    local work=$1 target=$2 source=$3 from=$1/gomodcache/cache/download stage cache=$CNE_STATE/cache/gomod-download file relative allowlist previous=''
+    allowlist=$work/module-allowlist
+    [[ -f $allowlist ]] || cne_download_module_allowlist "$source" > "$allowlist" || return 1
+    [[ -d $from ]] || return 0
+    [[ -z $(find "$from" -type l -print -quit) ]] || return 1
+    stage=$(mktemp -d "$CNE_STATE/cache/.gomod-publish.XXXXXXXX") || return 1
+    while IFS= read -r file; do
+        relative=${file#"$from"/}
+        case $relative in *.mod|*.info|*.zip) ;; *) continue;; esac
+        cne_download_module_name_ok "$relative" "$allowlist" || continue
+        mkdir -p "$stage/${relative%/*}" && cp "$file" "$stage/$relative" || { rm -rf "$stage"; return 1; }
+    done < <(find "$from" -type f -print | LC_ALL=C sort)
+    if [[ ${CNE_AWG_REFRESH_MODULE_CACHE:-0} != 1 && -d $cache && ! -L $cache ]]; then
+        for relative in .ready.amd64 .ready.arm64; do
+            if [[ -f $cache/$relative && ! -L $cache/$relative ]] && [[ $(cat "$cache/$relative") == "730d6c39d0c4e348a3d080bebe496664215e5c99 ${relative#.ready.}" ]]; then
+                cp "$cache/$relative" "$stage/$relative" || { rm -rf "$stage"; return 1; }
+            fi
+        done
+    fi
+    printf '%s %s\n' 730d6c39d0c4e348a3d080bebe496664215e5c99 "$target" > "$stage/.ready.$target" || { rm -rf "$stage"; return 1; }
+    chmod -R go-rwx "$stage" || { rm -rf "$stage"; return 1; }
+    if [[ -e $cache || -L $cache ]]; then
+        cne_safe_directory "$cache" || { rm -rf "$stage"; return 1; }
+        previous=$(mktemp -d "$CNE_STATE/cache/.gomod-previous.XXXXXXXX") && rmdir "$previous" && mv "$cache" "$previous" || { rm -rf "$stage"; return 1; }
+    fi
+    if ! mv "$stage" "$cache"; then [[ -z $previous ]] || mv "$previous" "$cache"; rm -rf "$stage"; return 1; fi
+    [[ -z $previous ]] || rm -rf "$previous"
+}
+
+cne_download_bundle_tools() {
+    local tool
+    for tool in tar gzip sha256sum find wc head awk sort uniq; do command -v "$tool" >/dev/null 2>&1 || { cne_error "缓存管理缺少 $tool；请先在可联网环境准备依赖。"; return 1; }; done
+    cne_safe_directory "$CNE_STATE/cache"
+}
+
+cne_download_tar() {
+    # Linux coreutils provides timeout. Tests on other hosts use small archives.
+    if command -v timeout >/dev/null 2>&1; then timeout --signal=TERM --kill-after=5s 60s tar "$@"; else tar "$@"; fi
+}
+
+cne_download_bundle_name_ok() {
+    local name=$1 component
+    case $name in
+        manifest.tsv) return 0;;
+        archives/*) component=${name#archives/}; cne_download_component_sha "$component" >/dev/null;;
+        modules/.ready.amd64|modules/.ready.arm64) return 0;;
+        modules/*) [[ ${name#modules/} =~ ^[A-Za-z0-9.!_+/-]+/@v/[A-Za-z0-9.!_+-]+\.(mod|info|zip)$ && $name != *'../'* && $name != *'/..'* ]];;
+        *) return 1;;
+    esac
+}
+
+cne_download_bundle_extract() {
+    local bundle=$1 member=$2 destination=$3 maximum=$4 size
+    # Stream one allowlisted regular member; never extract an archive tree.
+    cne_download_tar -xOzf "$bundle" "$member" | head -c "$((maximum+1))" > "$destination" || return 1
+    size=$(cne_download_size "$destination") || return 1
+    ((size<=maximum))
+}
+
+cne_download_cache_publish() {
+    local stage=$1 replacement previous file cache=$CNE_STATE/cache
+    cne_safe_directory "$cache" || return 1
+    [[ -z $(find "$cache" -type l -print -quit) ]] || { cne_error '现有组件缓存含符号链接，未导入。'; return 1; }
+    replacement=$(mktemp -d "$CNE_STATE/.cache-new.XXXXXXXX") || return 1
+    # Preserve locally built engines, but never accept engines from a bundle.
+    cp -a "$cache/." "$replacement/" || { rm -rf "$replacement"; return 1; }
+    if [[ -d $stage/archives ]]; then
+        while IFS= read -r file; do chmod 600 "$file" && mv "$file" "$replacement/${file##*/}" || { rm -rf "$replacement"; return 1; }; done < <(find "$stage/archives" -type f -print)
+    fi
+    if [[ -d $stage/modules ]]; then
+        chmod -R go-rwx "$stage/modules" || { rm -rf "$replacement"; return 1; }
+        if [[ -d $replacement/gomod-download ]]; then chmod -R u+w "$replacement/gomod-download" && rm -rf "$replacement/gomod-download" || { rm -rf "$replacement"; return 1; }; fi
+        mv "$stage/modules" "$replacement/gomod-download" || { rm -rf "$replacement"; return 1; }
+    fi
+    previous=$(mktemp -d "$CNE_STATE/.cache-before-import.XXXXXXXX") && rmdir "$previous" || { rm -rf "$replacement"; return 1; }
+    mv "$cache" "$previous" || { rm -rf "$replacement"; return 1; }
+    if ! mv "$replacement" "$cache"; then
+        if ! mv "$previous" "$cache"; then cne_error "缓存发布和恢复均未完成，原缓存保留在 $previous。"; fi
+        rm -rf "$replacement"; return 1
+    fi
+    chmod -R u+w "$previous" && rm -rf "$previous" || cne_note "缓存已导入，但旧临时目录尚未清理：$previous"
+}
+
+cne_download_bundle_export() {
+    local output=$1 stage name expected url source=$CNE_STATE/cache/amneziawg-go-730d6c39d0c4e348a3d080bebe496664215e5c99.tar.gz file relative size hash count=0 module_count=0 allowlist list temporary
+    cne_download_bundle_tools || return 1
+    [[ $output == /* && ! -e $output && ! -L $output && -d ${output%/*} && ! -L ${output%/*} ]] || { cne_error '请填写尚不存在的绝对输出文件路径。'; return 1; }
+    stage=$(mktemp -d "$CNE_TEMP/cache-export.XXXXXXXX") || return 1
+    mkdir "$stage/archives" "$stage/modules" || return 1
+    while IFS=$'\t' read -r name expected url; do
+        file=$CNE_STATE/cache/$name
+        [[ -e $file || -L $file ]] || continue
+        [[ -f $file && ! -L $file && -O $file ]] && [[ $(sha256sum "$file" | awk '{print $1}') == "$expected" ]] || { cne_error "缓存组件未通过校验：$name"; return 1; }
+        cp "$file" "$stage/archives/$name" || return 1
+        count=$((count+1))
+    done < <(cne_download_component_specs)
+    ((count)) || { cne_error '还没有已校验组件缓存，请先选择“准备完整缓存”。'; return 1; }
+    if [[ -d $CNE_STATE/cache/gomod-download ]]; then
+        cne_safe_directory "$CNE_STATE/cache/gomod-download" || return 1
+        [[ -z $(find "$CNE_STATE/cache/gomod-download" -type l -print -quit) ]] || { cne_error 'Go 缓存不能含符号链接。'; return 1; }
+        allowlist=$stage/module-allowlist
+        cne_download_module_allowlist "$source" > "$allowlist" || return 1
+        while IFS= read -r file; do
+            relative=${file#"$CNE_STATE/cache/gomod-download"/}
+            case $relative in
+                .ready.amd64|.ready.arm64)
+                    [[ $(cat "$file") == "730d6c39d0c4e348a3d080bebe496664215e5c99 ${relative#.ready.}" ]] || { cne_error 'Go 缓存完成记录无效。'; return 1; };;
+                *) cne_download_module_name_ok "$relative" "$allowlist" || { cne_error 'Go 缓存含非固定源码所需的文件。'; return 1; }; module_count=$((module_count+1));;
+            esac
+            if [[ $relative == */* ]]; then mkdir -p "$stage/modules/${relative%/*}" || return 1; fi
+            cp "$file" "$stage/modules/$relative" || return 1
+        done < <(find "$CNE_STATE/cache/gomod-download" -type f -print | LC_ALL=C sort)
+    fi
+    : > "$stage/manifest.tsv"
+    list=$stage/files
+    printf 'manifest.tsv\n' > "$list"
+    while IFS= read -r file; do
+        relative=${file#"$stage"/}
+        size=$(cne_download_size "$file") || return 1
+        [[ $size =~ ^[0-9]{1,10}$ ]] && ((size<=268435456)) || { cne_error '缓存文件超过允许大小。'; return 1; }
+        hash=$(sha256sum "$file" | awk '{print $1}') || return 1
+        printf '%s\t%s\t%s\n' "$relative" "$hash" "$size" >> "$stage/manifest.tsv" && printf '%s\n' "$relative" >> "$list" || return 1
+    done < <(find "$stage/archives" "$stage/modules" -type f -print | LC_ALL=C sort)
+    temporary=$(mktemp "${output%/*}/.cn-egress-cache.XXXXXXXX") || return 1
+    if ! (cd "$stage" && tar -czf "$temporary" -T files); then rm -f "$temporary"; return 1; fi
+    [[ ! -e $output && ! -L $output ]] && chmod 600 "$temporary" && mv "$temporary" "$output" || { rm -f "$temporary"; return 1; }
+    printf '缓存已导出：%s\n包含 %s/6 个固定组件、%s 个 Go 依赖文件；不包含私钥、节点设置或编译后的程序。\n' "$output" "$count" "$module_count"
+    if ((count<6 || module_count==0)) || [[ ! -f $stage/modules/.ready.amd64 || ! -f $stage/modules/.ready.arm64 ]]; then
+        printf '这是部分缓存。导入后缺少的组件或 Go 依赖仍需联网；可先选择“准备完整缓存”再导出。\n'
+    else printf '包含两个目标架构的已完成编译依赖缓存；导入后仍会用固定源码重新编译并核对 go.sum。系统软件包需另行准备。\n'; fi
+}
+
+cne_download_bundle_import() {
+    local bundle=$1 stage list manifest name hash size extra actual expected total=0 count=0 source allowlist file relative cache previous=''
+    cne_download_bundle_tools || return 1
+    [[ $bundle == /* && -f $bundle && ! -L $bundle ]] || { cne_error '请填写缓存包的绝对文件路径，不能使用符号链接。'; return 1; }
+    size=$(cne_download_size "$bundle") || return 1
+    [[ $size =~ ^[0-9]{1,10}$ ]] && ((size<=1073741824)) || { cne_error '缓存包超过允许大小。'; return 1; }
+    stage=$(mktemp -d "$CNE_TEMP/cache-import.XXXXXXXX") || return 1
+    list=$stage/list
+    cne_download_tar -P -tzf "$bundle" > "$list" || { cne_error '无法读取缓存包。'; return 1; }
+    [[ -z $(LC_ALL=C sort "$list" | uniq -d) ]] && [[ $(wc -l < "$list") -le 4096 ]] || { cne_error '缓存包含重复文件或文件数过多。'; return 1; }
+    while IFS= read -r name; do cne_download_bundle_name_ok "$name" || { cne_error '缓存包含不允许的文件名。'; return 1; }; done < "$list"
+    cne_download_tar -P -tvzf "$bundle" | awk 'substr($0,1,1)!="-"{bad=1}END{exit bad?1:0}' || { cne_error '缓存包仅允许普通文件，不能含目录、链接或设备文件。'; return 1; }
+    grep -Fqx manifest.tsv "$list" || { cne_error '缓存包缺少清单。'; return 1; }
+    manifest=$stage/manifest.tsv
+    cne_download_bundle_extract "$bundle" manifest.tsv "$manifest" 262144 || { cne_error '缓存清单无效或过大。'; return 1; }
+    : > "$stage/expected-list"
+    printf 'manifest.tsv\n' >> "$stage/expected-list"
+    while IFS=$'\t' read -r name hash size extra; do
+        [[ -z $extra && $name != manifest.tsv && $hash =~ ^[0-9a-f]{64}$ && $size =~ ^[0-9]{1,10}$ ]] && ((10#$size<=268435456)) && cne_download_bundle_name_ok "$name" || { cne_error '缓存清单格式无效。'; return 1; }
+        count=$((count+1)); total=$((total+10#$size))
+        ((count<=4095 && total<=1073741824)) || { cne_error '缓存展开大小超过限制。'; return 1; }
+        printf '%s\n' "$name" >> "$stage/expected-list"
+        mkdir -p "$stage/${name%/*}" || return 1
+        cne_download_bundle_extract "$bundle" "$name" "$stage/$name" "$((10#$size))" || { cne_error '缓存文件大小不符。'; return 1; }
+        actual=$(sha256sum "$stage/$name" | awk '{print $1}') || return 1
+        [[ $actual == "$hash" && $(cne_download_size "$stage/$name") == "$size" ]] || { cne_error '缓存文件校验失败。'; return 1; }
+        case $name in
+            archives/*) expected=$(cne_download_component_sha "${name#archives/}") || return 1; [[ $actual == "$expected" ]] || { cne_error '缓存组件不符合脚本固定 SHA-256。'; return 1; };;
+            modules/.ready.*) [[ $(cat "$stage/$name") == "730d6c39d0c4e348a3d080bebe496664215e5c99 ${name#modules/.ready.}" ]] || { cne_error 'Go 缓存完成记录无效。'; return 1; };;
+        esac
+    done < "$manifest"
+    ((count)) && [[ -z $(LC_ALL=C sort "$stage/expected-list" | uniq -d) ]] || { cne_error '缓存清单为空或含重复项目。'; return 1; }
+    LC_ALL=C sort "$list" > "$stage/sorted-list"; LC_ALL=C sort "$stage/expected-list" > "$stage/sorted-expected"
+    cmp -s "$stage/sorted-list" "$stage/sorted-expected" || { cne_error '缓存文件与清单不一致。'; return 1; }
+    if [[ -d $stage/modules ]]; then
+        source=$stage/archives/amneziawg-go-730d6c39d0c4e348a3d080bebe496664215e5c99.tar.gz
+        [[ -f $source ]] || { cne_error 'Go 依赖缓存必须同时包含固定源码包。'; return 1; }
+        allowlist=$stage/module-allowlist
+        cne_download_module_allowlist "$source" > "$allowlist" || return 1
+        while IFS= read -r file; do
+            relative=${file#"$stage/modules"/}
+            [[ $relative == .ready.amd64 || $relative == .ready.arm64 ]] || cne_download_module_name_ok "$relative" "$allowlist" || { cne_error '缓存模块不属于固定源码的 go.sum。'; return 1; }
+        done < <(find "$stage/modules" -type f -print)
+    fi
+    # Every member and existing destination passes validation before replacing
+    # the cache directory. A failed publication restores the whole old cache.
+    if [[ -d $stage/archives ]]; then
+        while IFS= read -r file; do
+            relative=$CNE_STATE/cache/${file##*/}
+            [[ ! -L $relative && ( ! -e $relative || -f $relative && -O $relative ) ]] || { cne_error '现有组件缓存路径不安全，未导入。'; return 1; }
+        done < <(find "$stage/archives" -type f -print)
+    fi
+    cne_download_cache_publish "$stage" || return 1
+    printf '缓存已导入。固定组件已核对脚本内的 SHA-256；Go 依赖会在重新编译时按固定源码 go.sum 再校验。\n未导入编译后的程序、私钥或节点配置；缓存不足时仍需联网。\n'
+}
+
+cne_download_prepare_cache() (
+    local name expected url target
+    cne_bootstrap install && cne_download_bundle_tools && cne_download_load || return 1
+    while IFS=$'\t' read -r name expected url; do cne_download_verified "$url" "$expected" "$CNE_STATE/cache/$name" "$name" || return 1; done < <(cne_download_component_specs)
+    CNE_AWG_FORCE_MODULE_CACHE=1
+    CNE_AWG_REFRESH_MODULE_CACHE=1
+    for target in amd64 arm64; do cne_fetch_awg "$target" || return 1; CNE_AWG_REFRESH_MODULE_CACHE=0; done
+    printf '固定组件和两个目标架构的 Go 编译依赖缓存已准备，可导出。APT 系统依赖需在目标管理机和节点另行准备。\n'
+)
+
+cne_download_bundle_menu() {
+    local choice file
+    printf '\n组件缓存\n  1. 导出当前缓存\n  2. 导入缓存包\n  3. 准备完整缓存（需联网下载并编译）\n  0. 取消\n'
+    cne_prompt '请选择' 0 || return 1; choice=$CNE_ANSWER
+    case $choice in
+        0) return 0;;
+        1) cne_prompt '输出绝对路径' "$CNE_STATE/component-cache-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || return 1; file=$CNE_ANSWER; cne_download_bundle_export "$file";;
+        2) cne_prompt '缓存包绝对路径' || return 1; file=$CNE_ANSWER; cne_download_bundle_import "$file";;
+        3) cne_download_prepare_cache;;
+        *) cne_error '请输入 0、1、2 或 3。'; return 1;;
+    esac
+}
+#!/usr/bin/env bash
 # Pinned, userspace-only AmneziaWG 2.0 build. Sourcing has no side effects.
 # The upstream Go repository publishes source tags, not Linux release binaries.
 CNE_AWG_GO_COMMIT=730d6c39d0c4e348a3d080bebe496664215e5c99
@@ -1697,21 +2342,7 @@ cne_awg_cleanup() {
 
 # URL SHA256 CACHE_FILE; publish only a completely verified download.
 cne_awg_download() {
-    local url=$1 checksum=$2 archive=$3 temporary actual
-    [[ ! -L $archive ]] || return 1
-    if [[ -f $archive ]]; then
-        actual=$(sha256sum "$archive" | awk '{print $1}') || return 1
-        [[ $actual != "$checksum" ]] || return 0
-    fi
-    temporary=$(mktemp "$CNE_TEMP/awg-download.XXXXXXXX") || return 1
-    if ! curl -fL --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$temporary"; then rm -f "$temporary"; cne_error "组件下载失败：$url。配置尚未替换；请检查网络或 HTTPS_PROXY 后重试。"; return 1; fi
-    actual=$(sha256sum "$temporary" | awk '{print $1}') || { rm -f "$temporary"; return 1; }
-    if [[ $actual != "$checksum" ]]; then
-        rm -f "$temporary"
-        cne_error 'AmneziaWG 组件校验失败，已停止。'
-        return 1
-    fi
-    chmod 600 "$temporary" && mv "$temporary" "$archive"
+    cne_download_verified "$1" "$2" "$3" 'AmneziaWG 组件'
 }
 
 # TARGET_ARCH -> CNE_AWG_ENGINE and CNE_AWG_TOOLS_SOURCE. Build on the manager;
@@ -1735,7 +2366,7 @@ cne_fetch_awg() {
     engine=$CNE_STATE/cache/amneziawg-go-0.2.16-linux-$target
     digest=$engine.sha256
     [[ ! -L $engine && ! -L $digest ]] || return 1
-    if [[ -x $engine && -f $digest ]]; then
+    if [[ ${CNE_AWG_FORCE_MODULE_CACHE:-0} != 1 && -x $engine && -f $digest ]]; then
         IFS= read -r existing < "$digest" || return 1
         if [[ $existing =~ ^[0-9a-f]{64}$ && $(sha256sum "$engine" | awk '{print $1}') == "$existing" ]]; then
             CNE_AWG_ENGINE=$engine; CNE_AWG_TOOLS_SOURCE=$tools_archive
@@ -1746,14 +2377,16 @@ cne_fetch_awg() {
     mkdir "$work/source" "$work/gocache" "$work/gomodcache" || return 1
     tar -xzf "$go_archive" -C "$work" || return 1
     tar -xzf "$engine_archive" --strip-components=1 -C "$work/source" || return 1
+    cne_download_modules_seed "$work" "$target" "$engine_archive" || { cne_awg_cleanup "$work" || :; return 1; }
     # GOTOOLCHAIN=local prevents a source directive from fetching another Go.
     # Go verifies dependencies against the source's go.sum and checksum database.
     (cd "$work/source" && timeout --signal=TERM --kill-after=10s 600s env CGO_ENABLED=0 GOOS=linux GOARCH="$target" \
         GOENV=off GOTOOLCHAIN=local GOWORK=off GOFLAGS= GOAMD64=v1 GOARM64=v8.0 \
         GOPRIVATE= GONOSUMDB= GONOPROXY= GOINSECURE= GOCACHE="$work/gocache" \
-        GOMODCACHE="$work/gomodcache" GOPROXY=https://proxy.golang.org \
+        GOMODCACHE="$work/gomodcache" GOPROXY="$CNE_GO_PROXY" \
         GOSUMDB=sum.golang.org "$work/go/bin/go" build -mod=readonly -trimpath \
-        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
+        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请在菜单 18 检查 Go 模块代理，或在菜单 19 准备/导入完整缓存后重试。'; return 1; }
+    cne_download_modules_publish "$work" "$target" "$engine_archive" || { cne_awg_cleanup "$work" || :; return 1; }
     chmod 755 "$work/amneziawg-go" || return 1
     existing=$(sha256sum "$work/amneziawg-go" | awk '{print $1}') || return 1
     printf '%s\n' "$existing" > "$work/engine.sha256" || return 1
@@ -2215,7 +2848,7 @@ EOF
 )
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.1.1
+CNE_VERSION=2.2.0
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -2270,7 +2903,7 @@ cne_setup_prompt() {
 }
 cne_mutation_guard() {
     [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || {
-        cne_error '存在尚未完成恢复的安装。请先选择“15. 重试恢复”，恢复前可以查看状态、日志和诊断。'
+        cne_error '存在尚未完成恢复的操作。请先选择“15. 重试恢复”，恢复前可以查看状态、日志和诊断。'
         return 1
     }
 }
@@ -2292,8 +2925,11 @@ cne_initialize() {
     cne_safe_directory "$CNE_STATE" || return 1
     [[ ! -L $CNE_STATE/lock ]] || return 1
     exec 8>"$CNE_STATE/lock"
-    flock -n 8 || { cne_error '已有管理菜单运行，请先退出那个窗口。'; return 1; }
-    for child in cache clients history; do cne_safe_directory "$CNE_STATE/$child" || return 1; done
+    if ! flock -n 8; then
+        if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then cne_note '管理菜单或其他维护正在运行，本次自动检查延后 15 分钟。'; return 75; fi
+        cne_error '已有管理菜单运行，请先退出那个窗口。'; return 1
+    fi
+    for child in cache clients history backups; do cne_safe_directory "$CNE_STATE/$child" || return 1; done
     CNE_TEMP=$(mktemp -d "$CNE_STATE/.session.XXXXXX") || return 1
     [[ ! -L $CNE_STATE/known_hosts ]] || return 1
     touch "$CNE_STATE/known_hosts" && chmod 600 "$CNE_STATE/known_hosts" || return 1
@@ -2432,7 +3068,11 @@ cne_setup() {
     CNE_PASSWORDS=('' '' ''); CNE_SUDOS=('' '' '')
     printf '\n节点已保存。SSH 密码仅在本次运行期间使用。\n'
 }
-cne_require_config() { [[ -n ${CNE_HOSTS[0]} && -n ${CNE_HOSTS[1]} && -n ${CNE_HOSTS[2]} ]] || cne_setup; }
+cne_require_config() {
+    [[ -n ${CNE_HOSTS[0]} && -n ${CNE_HOSTS[1]} && -n ${CNE_HOSTS[2]} ]] && return 0
+    [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error '自动维护缺少三个节点的配置，请先运行管理菜单。'; return 1; }
+    cne_setup
+}
 cne_authenticate() {
     local idx=$1
     if [[ -f $CNE_TEMP/auth-failed-$idx ]]; then
@@ -2443,8 +3083,10 @@ cne_authenticate() {
         CNE_PASSWORDS[$idx]=''; CNE_SUDOS[$idx]=''
         if [[ $(id -u) != 0 ]]; then
             command -v sudo >/dev/null 2>&1 || { cne_error '管理本机服务需要 root 或 sudo。'; return 1; }
-            [[ ${CNE_AUTH_READY[$idx]} == 1 ]] || cne_note '本机管理需要管理员权限，请完成 sudo 验证。'
-            sudo -v || return 1
+            if [[ ${CNE_NONINTERACTIVE:-0} != 1 ]]; then
+                [[ ${CNE_AUTH_READY[$idx]} == 1 ]] || cne_note '本机管理需要管理员权限，请完成 sudo 验证。'
+                sudo -v || return 1
+            fi
         fi
         CNE_AUTH_READY[$idx]=1
         return 0
@@ -2455,6 +3097,12 @@ cne_authenticate() {
         return 1
     fi
     cne_bootstrap ssh || return 1
+    if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+        [[ ${CNE_IDENTITIES[$idx]} != - ]] || { cne_error "${CNE_LABELS[$idx]}自动维护需要 SSH 密钥登录。"; return 1; }
+        ssh-keygen -y -P '' -f "${CNE_IDENTITIES[$idx]}" </dev/null >/dev/null 2>&1 || { cne_error "${CNE_LABELS[$idx]}自动维护需要无需口令的 SSH 私钥。"; return 1; }
+        CNE_PASSWORDS[$idx]=''; CNE_SUDOS[$idx]=''; CNE_AUTH_READY[$idx]=1
+        return 0
+    fi
     [[ ${CNE_AUTH_READY[$idx]} == 1 ]] && return 0
     if [[ ${CNE_IDENTITIES[$idx]} == - ]]; then
         cne_secret "${CNE_LABELS[$idx]} ${CNE_HOSTS[$idx]} SSH 密码" || return 1
@@ -2474,9 +3122,14 @@ cne_send_script() {
     if [[ ${CNE_CONNECTIONS[$idx]:-ssh} == local ]]; then
         if [[ $(id -u) == 0 ]]; then /bin/bash "$script" </dev/null
         else
+            if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+                sudo -n -k /bin/bash "$script" </dev/null
+                return $?
+            fi
             # Refresh valid sudo timestamps between operations. A long build
             # can outlive the cache; revalidate before executing the RPC file.
             if ! sudo -n -v 2>/dev/null; then
+                [[ ${CNE_NONINTERACTIVE:-0} != 1 ]] || { cne_error '自动维护的本机 sudo 验证失败。'; return 1; }
                 cne_note '本机管理员授权已过期，请重新完成 sudo 验证。'
                 sudo -v || return 1
             fi
@@ -2485,6 +3138,13 @@ cne_send_script() {
         return $?
     fi
     local args=(-T -F /dev/null -p "${CNE_PORTS[$idx]}" -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$CNE_STATE/known_hosts" -o LogLevel=ERROR -o NumberOfPasswordPrompts=1)
+    if [[ ${CNE_NONINTERACTIVE:-0} == 1 ]]; then
+        args+=(-i "${CNE_IDENTITIES[$idx]}" -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no)
+        command='/bin/bash -s'; [[ ${CNE_USERS[$idx]} == root ]] || command='sudo -n -k /bin/bash -s'
+        args+=("${CNE_USERS[$idx]}@${CNE_HOSTS[$idx]}" "$command")
+        ssh "${args[@]}" < "$script"
+        return $?
+    fi
     local password_args=(-d 9)
     if [[ ${CNE_IDENTITIES[$idx]} == - ]]; then args+=(-o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive)
     else args+=(-i "${CNE_IDENTITIES[$idx]}" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no); password_args+=(-P passphrase); fi
@@ -2530,6 +3190,27 @@ cne_remote_install() {
     if [[ $result != 0 ]]; then CNE_AUTH_READY[$idx]=0; : > "$CNE_TEMP/auth-failed-$idx"; fi
     return "$result"
 }
+cne_remote_payload() {
+    local idx=$1 action=$2 archive=$3 script result
+    shift 3
+    [[ $action == certificate-apply || $action == restore-import ]] && [[ -f $archive && ! -L $archive && -O $archive ]] || return 1
+    script=$(mktemp "$CNE_TEMP/payload.XXXXXX") || return 1
+    {
+        printf 'set -Eeuo pipefail\nexport LC_ALL=C\nCNE_NODE_LIBRARY=1\n'
+        cne_node_source
+        printf '\ncne_upload=$(mktemp /root/.cn-egress-maintenance.XXXXXXXX)\ntrap '\''rm -f "$cne_upload"'\'' EXIT\n'
+        printf 'base64 -d > "$cne_upload" <<'\''CNE_MAINTENANCE_PAYLOAD_V3'\''\n'
+        base64 < "$archive"
+        printf '\nCNE_MAINTENANCE_PAYLOAD_V3\n'
+        printf 'cne_node_main %q %q "$cne_upload"' "$action" "${CNE_ROLES[$idx]}"
+        [[ $# == 0 ]] || printf ' %q' "$@"
+        printf '\n'
+    } > "$script" || return 1
+    cne_send_script "$idx" "$script"; result=$?
+    rm -f "$script"
+    if [[ $result != 0 ]]; then CNE_AUTH_READY[$idx]=0; : > "$CNE_TEMP/auth-failed-$idx"; fi
+    return "$result"
+}
 cne_inspect_all() {
     local idx state role
     CNE_INSPECTIONS=()
@@ -2572,13 +3253,7 @@ cne_fetch_binary() {
         *) cne_error "不支持的节点架构：$arch"; return 1 ;;
     esac
     archive=$CNE_STATE/cache/wstunnel_11.0.0_linux_$arch.tar.gz
-    [[ ! -L $archive ]] || return 1
-    if [[ ! -f $archive ]] || [[ $(sha256sum "$archive" | awk '{print $1}') != "$checksum" ]]; then
-        cne_note "下载传输组件（$arch）…"
-        curl -fL --retry 2 --connect-timeout 15 --max-time 180 "https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_$arch.tar.gz" -o "$CNE_TEMP/download.tar.gz" || return 1
-        [[ $(sha256sum "$CNE_TEMP/download.tar.gz" | awk '{print $1}') == "$checksum" ]] || { cne_error '下载组件校验失败。'; return 1; }
-        mv "$CNE_TEMP/download.tar.gz" "$archive" || return 1
-    fi
+    cne_download_verified "https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_$arch.tar.gz" "$checksum" "$archive" "传输组件（$arch）" || return 1
     dir=$CNE_TEMP/binary-$arch; mkdir -p "$dir" || return 1
     # Only the named, checksum-verified executable is extracted.
     tar -xzf "$archive" -C "$dir" wstunnel || return 1
@@ -2593,7 +3268,7 @@ cne_transaction_abort() {
         rm -f "$CNE_STATE/active-transaction"
         return
     fi
-    cne_note '安装未完成，正在逆序恢复本次涉及的节点…'
+    cne_note '本次操作未完成，正在逆序恢复涉及的节点…'
     for ((position=${#CNE_TRANSACTION_ATTEMPTED[@]}-1; position>=0; position--)); do
         idx=${CNE_TRANSACTION_ATTEMPTED[$position]}
         if cne_remote "$idx" restore "${CNE_TRANSACTION_BACKUPS[$idx]}" "$CNE_TRANSACTION_ID"; then
@@ -2612,24 +3287,28 @@ cne_transaction_abort() {
         if [[ -f $directory/previous-deployment ]]; then
             cp "$directory/previous-deployment" "$CNE_STATE/current-deployment" || failures=1
         else rm -f "$CNE_STATE/current-deployment" || failures=1; fi
+        if [[ -f $directory/previous-ports && ! -L $directory/previous-ports ]]; then
+            cp "$directory/previous-ports" "$CNE_STATE/ports" || failures=1
+            read -r CNE_USER_PORT CNE_WSS_PORT < "$CNE_STATE/ports" || failures=1
+        fi
     fi
     CNE_TRANSACTION_ACTIVE=0
     if ((failures)); then
         printf 'rollback-incomplete\n' > "$directory/transaction-status"
-        cne_error "恢复未全部完成；下次安装会先重试恢复。记录：$directory"
+        cne_error "恢复未全部完成；请选择“15. 重试恢复”后再进行其他操作。记录：$directory"
         return 1
     fi
     printf 'rolled-back\n' > "$directory/transaction-status" || return 1
     rm -f "$CNE_STATE/active-transaction" || return 1
-    cne_note '本次涉及的节点和客户端配置已恢复到安装前状态。'
+    cne_note '本次涉及的节点和客户端配置已恢复到操作前状态。'
 }
 
 cne_transaction_recover() {
     local journal=$CNE_STATE/active-transaction id role backup idx line current_nodes previous_nodes
     [[ -e $journal || -L $journal ]] || return 0
-    [[ -f $journal && ! -L $journal && -O $journal ]] || { cne_error '未完成安装记录不安全。'; return 1; }
+    [[ -f $journal && ! -L $journal && -O $journal ]] || { cne_error '未完成操作记录不安全。'; return 1; }
     IFS= read -r id < "$journal" || return 1
-    [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$ ]] || { cne_error '未完成安装编号无效。'; return 1; }
+    [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$ ]] || { cne_error '未完成操作编号无效。'; return 1; }
     CNE_TRANSACTION_DIRECTORY=$CNE_STATE/history/$id
     CNE_TRANSACTION_ID=$id
     [[ -d $CNE_TRANSACTION_DIRECTORY ]] && cne_safe_directory "$CNE_TRANSACTION_DIRECTORY" || return 1
@@ -2641,7 +3320,7 @@ cne_transaction_recover() {
         return
     fi
     current_nodes=$(cne_nodes_canonical "$CNE_STATE/nodes.tsv") && previous_nodes=$(cne_nodes_canonical "$CNE_TRANSACTION_DIRECTORY/nodes.tsv") || { cne_error '当前节点已改变，或保存的节点格式无效。请恢复该次记录中的节点设置后重试。'; return 1; }
-    [[ $current_nodes == "$previous_nodes" ]] || { cne_error '存在未完成安装，但当前节点已改变。请恢复该次记录中的节点设置后重试，避免恢复到另一台机器。'; return 1; }
+    [[ $current_nodes == "$previous_nodes" ]] || { cne_error '存在未完成操作，但当前节点已改变。请恢复该次记录中的节点设置后重试，避免恢复到另一台机器。'; return 1; }
     CNE_TRANSACTION_BACKUPS=('' '' '')
     while IFS=$'\t' read -r role backup; do
         case $role in hk) idx=0;; sh) idx=1;; exit) idx=2;; *) return 1;; esac
@@ -2657,7 +3336,7 @@ cne_transaction_recover() {
         done < "$CNE_TRANSACTION_DIRECTORY/attempted.txt"
     fi
     CNE_TRANSACTION_ACTIVE=1
-    cne_note '发现上次中断的安装，先恢复原有配置。'
+    cne_note '发现上次中断的操作，先恢复原有配置。'
     cne_transaction_abort
 }
 
@@ -2670,6 +3349,14 @@ cne_transaction_begin() {
     printf 'prepared\n' > "$1/transaction-status" || return 1
     printf '%s\n' "$2" > "$CNE_TEMP/active-transaction" && mv "$CNE_TEMP/active-transaction" "$CNE_STATE/active-transaction" || return 1
     CNE_TRANSACTION_ACTIVE=1
+}
+cne_maintenance_commit() {
+    local directory=$1 id=$2
+    [[ $directory == "$CNE_TRANSACTION_DIRECTORY" && $id == "$CNE_TRANSACTION_ID" && $CNE_TRANSACTION_ACTIVE == 1 ]] || return 1
+    printf 'committed\n' > "$directory/transaction-status" || return 1
+    CNE_TRANSACTION_ACTIVE=0
+    rm -f "$CNE_STATE/active-transaction" || cne_note '维护已提交；残留记录将在下次运行时清理。'
+    return 0
 }
 
 cne_transaction_publish() {
@@ -2813,6 +3500,9 @@ cne_action_all() {
     cne_require_config || return 1
     case $action in start|restart) order=(1 2 0);; stop|uninstall) order=(0 2 1);; esac
     for idx in "${order[@]}"; do cne_authenticate "$idx" || return 1; done
+    if [[ $action == uninstall && ( -e $CNE_STATE/auto-renew || -L $CNE_STATE/auto-renew ) ]]; then
+        cne_renew_timer_disable || return 1
+    fi
     for idx in "${order[@]}"; do
         printf '\n%s · %s\n' "${CNE_LABELS[$idx]}" "$(cne_display_host "$idx")"
         if [[ $action == uninstall ]]; then cne_remote "$idx" uninstall confirm || result=1
@@ -3137,7 +3827,8 @@ cne_menu() {
         printf '  5. 启动服务\n  6. 停止服务\n  7. 重启服务\n  8. 查看日志\n  9. 备份配置\n\n'
         printf '  10. 客户端列表\n  11. 添加客户端\n  12. 显示配置与二维码\n  13. 撤销客户端\n\n'
         printf '  14. 卸载服务\n'
-        [[ ! -e $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成安装\n'
+        [[ ! -e $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成操作\n'
+        printf '  16. 恢复历史备份\n  17. 证书续期与自动维护\n  18. 配置下载来源\n  19. 组件离线包\n'
         printf '  0. 退出\n\n'
         cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
         case $choice in
@@ -3150,7 +3841,7 @@ cne_menu() {
             6) cne_action_all stop || cne_note '部分节点停止失败。';;
             7) cne_action_all restart || cne_note '部分节点重启失败。';;
             8) cne_action_all logs || cne_note '部分日志读取失败。';;
-            9) cne_action_all backup || cne_note '部分备份失败。';;
+            9) cne_backup_create || cne_note '备份未完成，具体原因见上方。';;
             10) cne_clients_list || cne_note '客户端列表读取失败。';;
             11) cne_client_add || cne_note '客户端添加未完成。';;
             12) cne_client_export || cne_note '配置导出未完成。';;
@@ -3160,20 +3851,633 @@ cne_menu() {
                 cne_prompt '确认卸载请输入 UNINSTALL' || return 0
                 [[ $CNE_ANSWER != UNINSTALL ]] || cne_action_all uninstall || cne_note '部分节点卸载未完成。';;
             15) cne_require_config && cne_transaction_recover || cne_note '恢复尚未完成，原备份和记录已保留。';;
+            16) cne_backup_restore || cne_note '恢复未完成，备份和记录已保留。';;
+            17) cne_renew_menu || cne_note '证书维护未完成，具体原因见上方。';;
+            18) cne_download_setup || cne_note '下载来源设置未完成。';;
+            19) cne_download_bundle_menu || cne_note '组件离线包操作未完成。';;
             *) cne_note '请输入菜单中的编号。';;
         esac
     done
 }
 cne_main() {
+    CNE_RUNNING_SCRIPT=${BASH_SOURCE[0]}
     case ${1:-menu} in
-        --help|-h) printf '一键安装与管理（纯 Bash）\n用法：bash cn-egress-oneclick.sh [menu|install|status|doctor]\n支持 Debian 12+、Ubuntu 22.04+，无需 Python。\n'; return 0 ;;
+        --help|-h) printf '一键安装与管理（纯 Bash）\n用法：bash cn-egress-oneclick.sh [menu|install|status|doctor|backup|renew|renew-auto]\n支持 Debian 12+、Ubuntu 22.04+，无需 Python。\n'; return 0 ;;
         --version) printf '%s\n' "$CNE_VERSION"; return 0 ;;
-        menu|install|status|doctor) ;;
+        menu|install|status|doctor|backup|renew) ;;
+        renew-auto) CNE_NONINTERACTIVE=1 ;;
         *) cne_error '未知命令，可用 --help 查看用法。'; return 1 ;;
     esac
     cne_bootstrap ui || return 1
-    cne_initialize || return 1
-    case ${1:-menu} in menu) cne_menu;; install) cne_install;; status) cne_status;; doctor) cne_action_all doctor;; esac
+    cne_initialize || return $?
+    cne_download_load || cne_note '下载设置无效；状态和离线配置仍可查看，请通过“18. 配置下载来源”修正。'
+    case ${1:-menu} in menu) cne_menu;; install) cne_install;; status) cne_status;; doctor) cne_action_all doctor;; backup) cne_backup_create;; renew) cne_renew_certificates;; renew-auto) cne_renew_auto || return 1;; esac
+}
+#!/usr/bin/env bash
+# Private, portable backup sets. No saved file is sourced or executed.
+cne_backup_id() {
+    local random
+    random=$(openssl rand -hex 6) || return 1
+    [[ $random =~ ^[a-f0-9]{12}$ ]] || return 1
+    printf '%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$random"
+}
+cne_backup_regular() {
+    [[ -f $1 && ! -L $1 && -O $1 && -r $1 ]] || { cne_error "备份文件不安全：${1##*/}"; return 1; }
+}
+cne_backup_client_files() {
+    local source=$1 destination=$2 file name size count=0
+    [[ -d $source && ! -L $source && -O $source && -r $source && -x $source ]] || return 1
+    mkdir -m 700 "$destination" || return 1
+    while IFS= read -r -d '' file; do
+        name=${file##*/}
+        [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$ ]] && cne_backup_regular "$file" || return 1
+        size=$(wc -c < "$file") || return 1
+        ((size<=1048576 && ++count<=1280)) || { cne_error '客户端备份文件过多或过大。'; return 1; }
+        cp -p -- "$file" "$destination/$name" && chmod 600 "$destination/$name" || return 1
+    done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+}
+cne_backup_info_valid() {
+    local data=$1 role=$2 state deployment key value
+    printf '%s\n' "$data" | awk -F= 'NF<2 || $1!~/^[a-z_][a-z0-9_]*$/ || ++seen[$1]!=1{bad=1} END{exit bad?1:0}' || return 1
+    state=$(cne_field "$data" state); deployment=$(cne_field "$data" deployment)
+    [[ $state == present || $state == absent ]] && [[ $deployment == none || $deployment =~ ^[A-Za-z0-9_-]{8,80}$ ]] || return 1
+    if [[ $state == present ]]; then [[ $(cne_field "$data" role) == "$role" ]] || return 1
+    else [[ $(cne_field "$data" role) == unknown || $(cne_field "$data" role) == "$role" ]] || return 1; fi
+    for key in ca_sha256 config_sha256 tls_sha256; do
+        value=$(cne_field "$data" "$key")
+        [[ $value == none || $value =~ ^[a-f0-9]{64}$ ]] || return 1
+    done
+    for key in main obfs dns users; do
+        value=$(cne_field "$data" "${key}_active")
+        [[ $value =~ ^(active|inactive|failed|activating|deactivating|reloading|maintenance|refreshing|unknown)$ ]] || return 1
+        value=$(cne_field "$data" "${key}_enabled")
+        [[ $value =~ ^(enabled|enabled-runtime|disabled|static|indirect|generated|masked|masked-runtime|transient|linked|linked-runtime|alias|bad|not-found|unknown)$ ]] || return 1
+    done
+}
+cne_backup_local_metadata() {
+    local destination=$1
+    cne_backup_regular "$CNE_STATE/nodes.tsv" && cne_backup_regular "$CNE_STATE/ports" || return 1
+    cp -p "$CNE_STATE/nodes.tsv" "$CNE_STATE/ports" "$destination/" || return 1
+    if [[ -e $CNE_STATE/current-deployment || -L $CNE_STATE/current-deployment ]]; then
+        cne_backup_regular "$CNE_STATE/current-deployment" && cp -p "$CNE_STATE/current-deployment" "$destination/" || return 1
+    fi
+    cne_backup_client_files "$CNE_STATE/clients" "$destination/clients"
+}
+cne_backup_relative_valid() {
+    case $1 in
+        format|nodes.tsv|ports|backups.tsv|current-deployment) return 0;;
+        info/hk.before|info/hk.after|info/sh.before|info/sh.after|info/exit.before|info/exit.after) return 0;;
+        archives/hk-*|archives/sh-*|archives/exit-*) [[ ${1#archives/} =~ ^(hk|sh|exit)-[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz$ ]]; return;;
+        clients/*) [[ ${1#clients/} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$ ]]; return;;
+        *) return 1;;
+    esac
+}
+cne_backup_manifest() {
+    local directory=$1 file relative list=$CNE_TEMP/backup-files.$$
+    : > "$list" || return 1
+    while IFS= read -r -d '' file; do
+        relative=${file#"$directory/"}
+        [[ $relative == manifest.sha256 || $relative == complete ]] && continue
+        cne_backup_relative_valid "$relative" && cne_backup_regular "$file" || { rm -f "$list"; return 1; }
+        printf '%s\n' "$relative" >> "$list" || return 1
+    done < <(find "$directory" -type f -print0)
+    LC_ALL=C sort "$list" -o "$list" || return 1
+    (cd "$directory" && while IFS= read -r relative; do sha256sum "$relative" || exit; done < "$list") > "$directory/manifest.sha256" || return 1
+    rm -f "$list"
+}
+cne_backup_validate() {
+    local directory=$1 file relative line digest entry idx role path extra user_port wss_port canonical count=0 size
+    local roles=() observed=() expected=()
+    [[ -d $CNE_STATE/backups && ! -L $CNE_STATE/backups && -O $CNE_STATE/backups && $directory == "$CNE_STATE/backups/"* && ${directory#"$CNE_STATE/backups/"} =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$ && -d $directory && ! -L $directory && -O $directory ]] || return 1
+    for file in complete manifest.sha256 format nodes.tsv ports backups.tsv; do cne_backup_regular "$directory/$file" || return 1; done
+    [[ $(cat "$directory/complete") == complete && $(cat "$directory/format") == $'format=cn-egress-coherent-backup-v1\nid='"${directory##*/}" ]] || return 1
+    while IFS= read -r -d '' file; do
+        relative=${file#"$directory/"}
+        if [[ -d $file && ! -L $file ]]; then
+            [[ $relative == clients || $relative == info || $relative == archives ]] && [[ -O $file ]] || return 1
+            continue
+        fi
+        cne_backup_regular "$file" || return 1
+        size=$(wc -c < "$file") || return 1
+        if [[ $relative == archives/* ]]; then ((size>0 && size<=104857600)) || return 1
+        else ((size<=1048576)) || return 1; fi
+        ((++count<=1300)) || return 1
+        [[ $relative == manifest.sha256 || $relative == complete ]] && continue
+        cne_backup_relative_valid "$relative" || return 1
+        observed+=("$relative")
+    done < <(find "$directory" -mindepth 1 -print0)
+    while IFS= read -r line; do
+        [[ $line =~ ^([a-f0-9]{64})\ \ (.+)$ ]] || return 1
+        digest=${BASH_REMATCH[1]}; entry=${BASH_REMATCH[2]}
+        cne_backup_relative_valid "$entry" && cne_backup_regular "$directory/$entry" || return 1
+        if ((${#expected[@]})); then for relative in "${expected[@]}"; do [[ $relative != "$entry" ]] || return 1; done; fi
+        [[ $(sha256sum "$directory/$entry" | awk '{print $1}') == "$digest" ]] || return 1
+        expected+=("$entry")
+    done < "$directory/manifest.sha256"
+    [[ ${#expected[@]} == "${#observed[@]}" ]] || return 1
+    canonical=$(cne_nodes_canonical "$directory/nodes.tsv") || return 1
+    idx=0
+    while IFS=$'\t' read -r role path user_port wss_port file relative extra; do
+        [[ -z $extra && $role == "${CNE_ROLES[$idx]}" ]] && cne_ipv4 "$path" && cne_port "$wss_port" && [[ $user_port =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ && ( $file == - || $file == /* ) && ( $relative == ssh || $relative == local ) ]] || return 1
+        roles+=("$path"); idx=$((idx+1))
+    done <<< "$canonical"
+    [[ ${roles[0]} != "${roles[1]}" && ${roles[0]} != "${roles[2]}" && ${roles[1]} != "${roles[2]}" ]] || return 1
+    IFS=' ' read -r user_port wss_port extra < "$directory/ports" || return 1
+    cne_port "$user_port" && cne_port "$wss_port" && [[ -z $extra && $user_port != 51831 && $(wc -l < "$directory/ports") -eq 1 ]] || return 1
+    idx=0
+    while IFS=$'\t' read -r role path extra; do
+        ((idx<3)) && [[ $role == "${CNE_ROLES[$idx]}" && -z $extra && $path =~ ^/root/cn-egress-backups/[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz$ ]] || return 1
+        cne_backup_regular "$directory/archives/$role-${path##*/}" || return 1
+        for file in before after; do
+            cne_backup_info_valid "$(cat "$directory/info/$role.$file")" "$role" || return 1
+        done
+        cmp -s "$directory/info/$role.before" "$directory/info/$role.after" || return 1
+        idx=$((idx+1))
+    done < "$directory/backups.tsv"
+    [[ $idx == 3 && -d $directory/clients && ! -L $directory/clients && -O $directory/clients ]] || return 1
+    if [[ -f $directory/current-deployment ]]; then [[ $(cat "$directory/current-deployment") =~ ^[A-Za-z0-9_-]{8,80}$ ]] || return 1; fi
+}
+cne_backup_create() {
+    local idx role id directory path info after exported size
+    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config || return 1
+    cne_safe_directory "$CNE_STATE/backups" || return 1
+    for idx in 0 1 2; do cne_authenticate "$idx" || return 1; done
+    id=$(cne_backup_id) || return 1
+    directory=$CNE_STATE/backups/$id
+    mkdir -m 700 "$directory" && mkdir -m 700 "$directory/info" "$directory/archives" || return 1
+    printf 'format=cn-egress-coherent-backup-v1\nid=%s\n' "$id" > "$directory/format" || return 1
+    cne_backup_local_metadata "$directory" || return 1
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}
+        info=$(cne_remote "$idx" maintenance-info) || return 1
+        cne_backup_info_valid "$info" "$role" || { cne_error '节点返回的维护状态无效，备份未完成。'; return 1; }
+        printf '%s\n' "$info" > "$directory/info/$role.before" || return 1
+    done
+    : > "$directory/backups.tsv" || return 1
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}
+        cne_note "备份${CNE_LABELS[$idx]}配置与服务状态…"
+        path=$(cne_remote "$idx" backup) || return 1
+        [[ $path =~ ^/root/cn-egress-backups/[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz$ ]] || return 1
+        exported=$CNE_TEMP/backup-export-$role
+        cne_remote "$idx" backup-export "$path" > "$exported" || return 1
+        base64 -d < "$exported" > "$directory/archives/$role-${path##*/}" || return 1
+        size=$(wc -c < "$directory/archives/$role-${path##*/}") || return 1
+        ((size>0 && size<=104857600)) || return 1
+        printf '%s\t%s\n' "$role" "$path" >> "$directory/backups.tsv" || return 1
+    done
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}
+        after=$(cne_remote "$idx" maintenance-info) || return 1
+        printf '%s\n' "$after" > "$directory/info/$role.after" || return 1
+        cmp -s "$directory/info/$role.before" "$directory/info/$role.after" || { cne_error '备份过程中节点配置或服务状态发生变化。此备份未完成，请重试。'; return 1; }
+    done
+    cmp -s "$CNE_STATE/nodes.tsv" "$directory/nodes.tsv" && cmp -s "$CNE_STATE/ports" "$directory/ports" && diff -r "$CNE_STATE/clients" "$directory/clients" >/dev/null || { cne_error '备份过程中本机配置发生变化，请重试。'; return 1; }
+    cne_backup_manifest "$directory" || return 1
+    printf 'complete\n' > "$directory/complete" || return 1
+    if ! cne_backup_validate "$directory"; then rm -f "$directory/complete"; cne_error '备份校验失败，未标记为可恢复。'; return 1; fi
+    CNE_BACKUP_CREATED=$directory
+    printf '\n备份完成：%s\n包含三台节点、设备配置和服务状态；含私钥，请保密整个目录。\n' "$directory"
+    cne_backup_restorable "$directory" || printf '当前三台节点的服务不完整或不属于同一套证书，此备份仅保留状态，不会列为历史恢复目标。\n'
+}
+cne_backup_pick() {
+    local directory answer index entries=()
+    CNE_BACKUP_SELECTION=''
+    printf '\n可恢复的历史备份\n'; cne_line
+    for directory in "$CNE_STATE/backups/"*; do
+        [[ -d $directory && ! -L $directory && -f $directory/complete ]] || continue
+        if cne_backup_validate "$directory" && cne_backup_restorable "$directory"; then
+            entries+=("$directory")
+            printf '  %s. %s（UTC）\n' "${#entries[@]}" "${directory##*/}"
+        else cne_note "跳过不完整、校验失败或缺少完整服务的备份：${directory##*/}"; fi
+    done
+    ((${#entries[@]})) || { cne_error '没有完整且通过校验的历史备份，请先使用“9. 备份配置”。'; return 1; }
+    while :; do
+        cne_prompt '请选择备份编号（0 取消）' || return 1; answer=$CNE_ANSWER
+        [[ $answer != 0 ]] || return 0
+        if [[ $answer =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$answer<=${#entries[@]})); then
+            index=$((10#$answer-1)); CNE_BACKUP_SELECTION=${entries[$index]}; return 0
+        fi
+        cne_note '请选择列表中的编号，或输入 0 取消。'
+    done
+}
+cne_backup_restorable() {
+    local directory=$1 role path extra archive data list transport ca expected_ca=''
+    while IFS=$'\t' read -r role path extra; do
+        data=$(cat "$directory/info/$role.before") || return 1
+        [[ $(cne_field "$data" state) == present && $(cne_field "$data" role) == "$role" ]] || return 1
+        ca=$(cne_field "$data" ca_sha256)
+        [[ $ca =~ ^[a-f0-9]{64}$ ]] || return 1
+        if [[ -z $expected_ca ]]; then expected_ca=$ca; else [[ $expected_ca == "$ca" ]] || return 1; fi
+        archive=$directory/archives/$role-${path##*/}
+        list=$(tar -tzf "$archive") || return 1
+        [[ $(tar -xOzf "$archive" etc/cn-egress/role 2>/dev/null) == "$role" && $(tar -xOzf "$archive" etc/cn-egress-wss/role 2>/dev/null) == "$role" ]] || return 1
+        for path in etc/systemd/system/cn-egress.service etc/systemd/system/cn-egress-obfs.service; do
+            printf '%s\n' "$list" | grep -Fxq "$path" || return 1
+        done
+        if [[ $role == exit ]]; then printf '%s\n' "$list" | grep -Fxq etc/systemd/system/cn-egress-dns.service || return 1; fi
+        if [[ $role == hk ]]; then
+            transport=$(tar -xOzf "$archive" etc/cn-egress/user-transport 2>/dev/null) || transport=wireguard
+            case $transport in awg2) printf '%s\n' "$list" | grep -Fxq etc/systemd/system/cn-egress-users.service || return 1;; wireguard) ;; *) return 1;; esac
+        fi
+    done < "$directory/backups.tsv"
+}
+cne_backup_active_chain() {
+    local directory=$1 data idx role
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}; data=$(cat "$directory/info/$role.before") || return 1
+        [[ $(cne_field "$data" state) == present && $(cne_field "$data" main_active) == active && $(cne_field "$data" obfs_active) == active ]] || return 1
+        if [[ $role == exit ]]; then [[ $(cne_field "$data" dns_active) == active ]] || return 1; fi
+        if [[ $role == hk ]] && [[ $(cne_field "$data" users_enabled) != not-found ]]; then [[ $(cne_field "$data" users_active) == active ]] || return 1; fi
+    done
+}
+cne_backup_publish() {
+    local source=$1 directory=$CNE_TRANSACTION_DIRECTORY prepared
+    [[ ! -L $CNE_STATE/clients && ! -L $CNE_STATE/current-deployment && ! -L $CNE_STATE/ports ]] || return 1
+    prepared=$(mktemp -d "$CNE_TEMP/restored-clients.XXXXXXXX") || return 1
+    rmdir "$prepared" && cne_backup_client_files "$source/clients" "$prepared" || return 1
+    if [[ -f $CNE_STATE/current-deployment ]]; then cp "$CNE_STATE/current-deployment" "$directory/previous-deployment" || return 1; fi
+    cp "$CNE_STATE/ports" "$directory/previous-ports" || return 1
+    : > "$directory/local-publish.started" || return 1
+    mv "$CNE_STATE/clients" "$directory/previous-clients" && mv "$prepared" "$CNE_STATE/clients" || return 1
+    cp "$source/ports" "$CNE_TEMP/restored-ports" && mv "$CNE_TEMP/restored-ports" "$CNE_STATE/ports" || return 1
+    printf '%s\n' "$CNE_TRANSACTION_ID" > "$CNE_TEMP/restored-deployment" && mv "$CNE_TEMP/restored-deployment" "$CNE_STATE/current-deployment" || return 1
+    read -r CNE_USER_PORT CNE_WSS_PORT < "$CNE_STATE/ports" || return 1
+}
+cne_backup_restore() {
+    local source idx role host user port identity connection extra id directory current path original before refreshed
+    local infos=() targets=() targets_paths=()
+    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config || return 1
+    cne_backup_pick || return 1; source=$CNE_BACKUP_SELECTION
+    [[ -n $source ]] || { printf '已取消。\n'; return 0; }
+    cne_backup_validate "$source" && cne_backup_restorable "$source" || { cne_error '备份校验失败或缺少完整服务，未更改服务。'; return 1; }
+    idx=0
+    while IFS=$'\t' read -r role host user port identity connection extra; do
+        [[ $role == "${CNE_ROLES[$idx]}" && $host == "${CNE_HOSTS[$idx]}" ]] || { cne_error '备份的节点地址与当前设置不一致。请先恢复同一组节点地址，避免覆盖另一台机器。'; return 1; }
+        idx=$((idx+1))
+    done < "$source/nodes.tsv"
+    printf '\n将恢复备份：%s（UTC）\n' "${source##*/}"
+    for idx in 0 1 2; do printf '  %s · %s\n' "${CNE_LABELS[$idx]}" "$(cne_display_host "$idx")"; done
+    printf '设备列表、密钥、端口和服务启停状态将回到该备份。后来新增的设备将失效，后来撤销的设备可能重新生效。\n恢复时连接会短暂中断；当前状态会先另行备份，失败会自动恢复。\n'
+    cne_prompt '确认恢复三台节点（y/N）' N || return 1
+    [[ $CNE_ANSWER == y || $CNE_ANSWER == Y ]] || { printf '已取消，服务与配置未改动。\n'; return 0; }
+    for idx in 0 1 2; do cne_authenticate "$idx" || return 1; done
+    id=$(cne_backup_id) || return 1; directory=$CNE_STATE/history/$id
+    mkdir -m 700 "$directory" || return 1
+    cp "$CNE_STATE/nodes.tsv" "$CNE_STATE/ports" "$directory/" || return 1
+    printf 'restore\n' > "$directory/operation" && printf '%s\n' "${source##*/}" > "$directory/source-backup" || return 1
+    CNE_TRANSACTION_BACKUPS=('' '' '')
+    : > "$directory/backups.tsv" || return 1
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}
+        before=$(cne_remote "$idx" maintenance-info) || return 1
+        cne_backup_info_valid "$before" "$role" || return 1
+        infos[$idx]=$before
+        path=$(cne_remote "$idx" backup) || return 1
+        [[ $path =~ ^/root/cn-egress-backups/[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz$ ]] || return 1
+        CNE_TRANSACTION_BACKUPS[$idx]=$path
+        printf '%s\t%s\n' "$role" "$path" >> "$directory/backups.tsv" || return 1
+    done
+    for idx in 0 1 2; do
+        refreshed=$(cne_remote "$idx" maintenance-info) || return 1
+        [[ $refreshed == "${infos[$idx]}" ]] || { cne_error '备份当前状态时节点发生变化，未开始恢复。'; return 1; }
+    done
+    idx=0
+    while IFS=$'\t' read -r role path; do targets_paths[$idx]=${path##*/}; targets[$idx]=$source/archives/$role-${path##*/}; idx=$((idx+1)); done < "$source/backups.tsv"
+    cne_transaction_begin "$directory" "$id" || return 1
+    for idx in 1 2 0; do
+        cne_note "正在恢复${CNE_LABELS[$idx]}…"
+        CNE_TRANSACTION_ATTEMPTED+=("$idx")
+        printf '%s\n' "$idx" >> "$directory/attempted.txt" || { cne_transaction_abort || :; return 1; }
+        current=$(cne_field "${infos[$idx]}" deployment)
+        if ! cne_remote_payload "$idx" restore-import "${targets[$idx]}" "${targets_paths[$idx]}" "$current" "$id"; then cne_transaction_abort || :; return 1; fi
+    done
+    if cne_backup_active_chain "$source"; then
+        if ! cne_verify_install; then cne_transaction_abort || :; return 1; fi
+    else cne_note '备份中部分服务原本未运行，已保留该状态；链路未启动，未做连通性验证。'; fi
+    if ! cne_backup_publish "$source" || ! cne_maintenance_commit "$directory" "$id"; then cne_transaction_abort || :; return 1; fi
+    printf '\n历史备份恢复完成。设备配置目录：%s\n当前状态备份记录：%s\n' "$CNE_STATE/clients" "$directory"
+}
+#!/usr/bin/env bash
+# Certificate-only transactions and an optional, password-free daily timer.
+cne_renew_collect() {
+    local idx role info ca expected='' host
+    CNE_RENEW_INFOS=()
+    for idx in 0 1 2; do
+        cne_authenticate "$idx" || return 1
+        info=$(cne_remote "$idx" maintenance-info) || return 1
+        role=${CNE_ROLES[$idx]}
+        cne_backup_info_valid "$info" "$role" && [[ $(cne_field "$info" state) == present ]] || { cne_error "${CNE_LABELS[$idx]}尚未完整安装，不能仅更新证书。"; return 1; }
+        ca=$(cne_field "$info" ca_sha256); host=$(cne_field "$info" wss_host)
+        [[ $ca =~ ^[a-f0-9]{64}$ && $host == "${CNE_HOSTS[1]}" ]] || { cne_error '节点的证书或中转地址不匹配，请先检查当前部署。'; return 1; }
+        if [[ -z $expected ]]; then expected=$ca; else [[ $ca == "$expected" ]] || { cne_error '三台节点使用的证书不属于同一套部署。'; return 1; }; fi
+        CNE_RENEW_INFOS[$idx]=$info
+    done
+}
+cne_renew_state_same() {
+    local before=$1 after=$2 key
+    for key in role config_sha256 wss_host main_active main_enabled obfs_active obfs_enabled dns_active dns_enabled users_active users_enabled; do
+        [[ $(cne_field "$before" "$key") == "$(cne_field "$after" "$key")" ]] || { cne_error "证书更新后 ${key} 发生了预期之外的变化。"; return 1; }
+    done
+}
+cne_renew_certificates() {
+    local automatic=${1:-manual} idx role id directory snapshot path extra before info ca payload stage
+    local infos=()
+    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config && cne_renew_collect || return 1
+    infos=("${CNE_RENEW_INFOS[@]}")
+    if [[ $automatic != automatic ]]; then
+        printf '\n将更新三台节点的传输证书，连接会短暂中断。手机和电脑的设备配置保持不变。\n更新前会保存完整备份，失败会恢复原状态。\n'
+        cne_prompt '确认更新证书（y/N）' N || return 1
+        [[ $CNE_ANSWER == y || $CNE_ANSWER == Y ]] || { printf '已取消。\n'; return 0; }
+    fi
+    cne_backup_create || return 1; snapshot=$CNE_BACKUP_CREATED
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}
+        [[ $(cat "$snapshot/info/$role.before") == "${infos[$idx]}" ]] || { cne_error '节点状态发生变化，请重新执行续期。'; return 1; }
+    done
+    id=$(cne_backup_id) || return 1; directory=$CNE_STATE/history/$id
+    mkdir -m 700 "$directory" || return 1
+    cp "$CNE_STATE/nodes.tsv" "$CNE_STATE/ports" "$snapshot/backups.tsv" "$directory/" || return 1
+    printf 'certificate-renewal\n' > "$directory/operation" || return 1
+    cne_render_pki "$directory/pki" "${CNE_HOSTS[1]}" || return 1
+    ca=$(sha256sum "$directory/pki/ca.crt" | awk '{print $1}') || return 1
+    CNE_TRANSACTION_BACKUPS=('' '' ''); idx=0
+    while IFS=$'\t' read -r role path extra; do
+        [[ $role == "${CNE_ROLES[$idx]}" && -z $extra ]] || return 1
+        CNE_TRANSACTION_BACKUPS[$idx]=$path; idx=$((idx+1))
+    done < "$directory/backups.tsv"
+    [[ $idx == 3 ]] || return 1
+    for idx in 0 1 2; do
+        role=${CNE_ROLES[$idx]}; stage=$directory/tls-$role
+        mkdir -m 700 "$stage" || return 1
+        cp "$directory/pki/ca.crt" "$stage/ca.crt" && cp "$directory/pki/$role.crt" "$stage/node.crt" && cp "$directory/pki/$role.key" "$stage/node.key" || return 1
+        tar -czf "$directory/$role.tls.tar.gz" -C "$stage" ca.crt node.crt node.key || return 1
+        info=$(cne_remote "$idx" maintenance-info) || return 1
+        [[ $info == "${infos[$idx]}" ]] || { cne_error '生成证书时节点状态发生变化，未开始更新。'; return 1; }
+    done
+    cne_transaction_begin "$directory" "$id" || return 1
+    for idx in 1 2 0; do
+        role=${CNE_ROLES[$idx]}; before=$(cne_field "${infos[$idx]}" deployment)
+        cne_note "更新${CNE_LABELS[$idx]}传输证书…"
+        CNE_TRANSACTION_ATTEMPTED+=("$idx")
+        printf '%s\n' "$idx" >> "$directory/attempted.txt" || { cne_transaction_abort || :; return 1; }
+        if ! cne_remote_payload "$idx" certificate-apply "$directory/$role.tls.tar.gz" "$before" "$id"; then cne_transaction_abort || :; return 1; fi
+    done
+    for idx in 0 1 2; do
+        info=$(cne_remote "$idx" maintenance-info) || { cne_transaction_abort || :; return 1; }
+        if ! cne_backup_info_valid "$info" "${CNE_ROLES[$idx]}" || ! cne_renew_state_same "${infos[$idx]}" "$info" || [[ $(cne_field "$info" deployment) != "$id" || $(cne_field "$info" ca_sha256) != "$ca" ]]; then
+            cne_transaction_abort || :; return 1
+        fi
+    done
+    if cne_backup_active_chain "$snapshot"; then
+        if ! cne_verify_install; then cne_transaction_abort || :; return 1; fi
+    else cne_note '已保留原来的服务启停状态；存在未启动的服务，本次不宣称链路可用。'; fi
+    if ! cne_renew_publish "$directory" "$id" || ! cne_maintenance_commit "$directory" "$id"; then cne_transaction_abort || :; return 1; fi
+    printf '\n证书已更新，设备配置无需重新导入。\n节点证书有效期：'
+    openssl x509 -in "$directory/pki/hk.crt" -noout -enddate || :
+    printf '更新前备份：%s\n' "$snapshot"
+}
+cne_renew_publish() {
+    local directory=$1 id=$2
+    [[ ! -L $CNE_STATE/current-deployment ]] || return 1
+    if [[ -e $CNE_STATE/current-deployment ]]; then cne_backup_regular "$CNE_STATE/current-deployment" && cp "$CNE_STATE/current-deployment" "$directory/previous-deployment" || return 1; fi
+    : > "$directory/local-publish.started" || return 1
+    printf '%s\n' "$id" > "$CNE_TEMP/renewed-deployment" && mv "$CNE_TEMP/renewed-deployment" "$CNE_STATE/current-deployment"
+}
+cne_renew_auto() {
+    local idx due=0 field value
+    CNE_NONINTERACTIVE=1
+    cne_bootstrap maintenance && cne_require_config || return 1
+    cne_transaction_recover || return 1
+    cne_renew_collect || return 1
+    for idx in 0 1 2; do
+        for field in cert_due ca_due; do
+            value=$(cne_field "${CNE_RENEW_INFOS[$idx]}" "$field")
+            [[ $value == 0 || $value == 1 ]] || { cne_error '节点未提供有效的证书到期状态。'; return 1; }
+            [[ $value != 1 ]] || due=1
+        done
+    done
+    if ((due)); then cne_renew_certificates automatic
+    else printf '证书有效期超过 30 天，无需更新。\n'; fi
+}
+cne_renew_noninteractive_probe() (
+    local idx
+    CNE_NONINTERACTIVE=1; CNE_AUTH_READY=(0 0 0); CNE_PASSWORDS=('' '' ''); CNE_SUDOS=('' '' '')
+    for idx in 0 1 2; do
+        cne_authenticate "$idx" && cne_remote "$idx" maintenance-info >/dev/null || { cne_error "${CNE_LABELS[$idx]}无法无交互维护。需要不带密码的 SSH 密钥及 root 或免密码 sudo；本机节点需要 root 或免密码 sudo。"; return 1; }
+    done
+)
+cne_renew_timer_id() {
+    [[ $CNE_STATE == /* && $CNE_STATE != *$'\n'* && $CNE_STATE != *$'\r'* && $HOME != *$'\n'* && $HOME != *$'\r'* ]] || return 1
+    CNE_RENEW_TIMER_ID=$(printf '%s' "$CNE_STATE" | sha256sum | awk '{print substr($1,1,12)}') || return 1
+    [[ $CNE_RENEW_TIMER_ID =~ ^[a-f0-9]{12}$ ]]
+}
+cne_renew_unit_quote() {
+    local value=$1
+    value=${value//\\/\\\\}; value=${value//\"/\\\"}; value=${value//%/%%}
+    printf '"%s"' "$value"
+}
+cne_renew_timer_files() {
+    local directory=$1 unit=cn-egress-renew-$CNE_RENEW_TIMER_ID uid
+    uid=$(id -u) || return 1
+    [[ $uid =~ ^[0-9]+$ ]] || return 1
+    cat > "$directory/service" <<EOF_SERVICE
+# Managed by cn-egress-oneclick; owner $CNE_RENEW_TIMER_ID
+[Unit]
+Description=cn-egress certificate maintenance
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+User=$uid
+UMask=0077
+Environment=$(cne_renew_unit_quote "HOME=$HOME")
+Environment=$(cne_renew_unit_quote "CNE_HOME=$CNE_STATE")
+Environment=CNE_NONINTERACTIVE=1
+ExecStart=/usr/local/lib/$unit/manager.sh renew-auto
+TimeoutStartSec=40min
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=15min
+EOF_SERVICE
+    cat > "$directory/timer" <<EOF_TIMER
+# Managed by cn-egress-oneclick; owner $CNE_RENEW_TIMER_ID
+[Unit]
+Description=cn-egress daily certificate check
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+Unit=$unit.service
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+}
+# Runs only through cne_root. Names and root-owned receipts constrain all writes.
+cne_renew_timer_root() {
+    local action=$1 identifier=$2 input=${3:-} unit directory service timer receipt pending candidate file mode expected proposed actual path drops base suffix proof stage temporary
+    cne_timer_publish_candidate() {
+        local item destination permission staged
+        for item in manager.sh service timer; do
+            case $item in manager.sh) destination=$directory/manager.sh; permission=755;; service) destination=$service; permission=644;; timer) destination=$timer; permission=644;; esac
+            staged=$(mktemp "${destination%/*}/.cn-egress-renew.XXXXXXXX") || return 1
+            if ! install -o 0 -g 0 -m "$permission" "$candidate/$item" "$staged" || ! mv "$staged" "$destination"; then rm -f "$staged"; return 1; fi
+        done
+        mv "$pending" "$receipt" && rm -rf "$candidate"
+    }
+    [[ $(id -u) == 0 && $identifier =~ ^[a-f0-9]{12}$ && ( $action == enable || $action == disable ) ]] || return 1
+    unit=cn-egress-renew-$identifier; directory=/usr/local/lib/$unit
+    service=/etc/systemd/system/$unit.service; timer=/etc/systemd/system/$unit.timer
+    receipt=$directory/ownership; pending=$directory/ownership.pending; candidate=$directory/candidate
+    for path in /usr /usr/local /usr/local/lib /etc /etc/systemd /etc/systemd/system; do
+        [[ -d $path && ! -L $path && -O $path ]] || return 1
+        mode=$(stat -c %a "$path") || return 1; (( (8#$mode & 022)==0 )) || return 1
+    done
+    # systemd also applies global and dashed-prefix drop-ins to new units.
+    for base in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        for suffix in service timer; do
+            for file in "$suffix.d" "cn-.$suffix.d" "cn-egress-.$suffix.d" "cn-egress-renew-.$suffix.d" "$unit.$suffix.d"; do
+                [[ ! -e $base/$file && ! -L $base/$file ]] || return 1
+            done
+        done
+    done
+    if [[ -e $directory || -L $directory ]]; then
+        [[ -d $directory && ! -L $directory && -O $directory ]] || return 1
+        mode=$(stat -c %a "$directory") || return 1; (( (8#$mode & 022)==0 )) || return 1
+        if [[ -e $candidate || -L $candidate ]]; then
+            [[ -d $candidate && ! -L $candidate && -O $candidate ]] || return 1
+            mode=$(stat -c %a "$candidate") || return 1; (( (8#$mode & 022)==0 )) || return 1
+            [[ $(find "$candidate" -mindepth 1 -maxdepth 1 | wc -l) == 4 ]] || return 1
+            [[ -f $candidate/ownership && ! -L $candidate/ownership && -O $candidate/ownership && $(wc -l < "$candidate/ownership") == 4 && $(head -n 1 "$candidate/ownership") == "$unit" ]] || return 1
+            for file in 2 3 4; do
+                case $file in 2) path=$candidate/manager.sh;; 3) path=$candidate/service;; 4) path=$candidate/timer;; esac
+                expected=$(sed -n "${file}p" "$candidate/ownership")
+                [[ -f $path && ! -L $path && -O $path && $expected =~ ^[a-f0-9]{64}$ && $(sha256sum "$path" | awk '{print $1}') == "$expected" ]] || return 1
+                mode=$(stat -c %a "$path") || return 1; (( (8#$mode & 022)==0 )) || return 1
+            done
+            if [[ ! -e $pending && ! -L $pending ]]; then
+                temporary=$(mktemp "$directory/.pending.XXXXXXXX") || return 1
+                cp "$candidate/ownership" "$temporary" && chmod 600 "$temporary" && mv "$temporary" "$pending" || return 1
+            else cmp -s "$candidate/ownership" "$pending" || return 1; fi
+        fi
+        for proof in "$receipt" "$pending"; do
+            [[ -e $proof || -L $proof ]] || continue
+            [[ -f $proof && ! -L $proof && -O $proof && $(wc -l < "$proof") == 4 ]] || return 1
+            mode=$(stat -c %a "$proof") || return 1; (( (8#$mode & 022)==0 )) || return 1
+            [[ $(sed -n '1p' "$proof") == "$unit" ]] || return 1
+            for file in 2 3 4; do expected=$(sed -n "${file}p" "$proof"); [[ $expected =~ ^[a-f0-9]{64}$ ]] || return 1; done
+        done
+        if [[ ! -f $receipt && ! -f $pending ]]; then
+            # Only a completely empty reserved directory can be retried here.
+            [[ $action == enable && -z $(find "$directory" -mindepth 1 -maxdepth 1 -print -quit) && ! -e $service && ! -L $service && ! -e $timer && ! -L $timer ]] || return 1
+        fi
+        for file in 2 3 4; do
+            case $file in 2) path=$directory/manager.sh;; 3) path=$service;; 4) path=$timer;; esac
+            expected=''; proposed=''
+            [[ ! -f $receipt ]] || expected=$(sed -n "${file}p" "$receipt")
+            [[ ! -f $pending ]] || proposed=$(sed -n "${file}p" "$pending")
+            if [[ ! -e $path && ! -L $path ]]; then
+                [[ -z $expected && ( -n $proposed || ! -f $receipt && ! -f $pending ) ]] || return 1
+                continue
+            fi
+            [[ -f $path && ! -L $path && -O $path ]] || return 1
+            mode=$(stat -c %a "$path") || return 1; (( (8#$mode & 022)==0 )) || return 1
+            actual=$(sha256sum "$path" | awk '{print $1}') || return 1
+            [[ $actual == "$expected" || $actual == "$proposed" ]] || return 1
+        done
+        for file in "$unit.service" "$unit.timer"; do
+            path=$(systemctl show "$file" -p FragmentPath --value 2>/dev/null) || path=''
+            drops=$(systemctl show "$file" -p DropInPaths --value 2>/dev/null) || drops=''
+            [[ ( -z $path || $path == "/etc/systemd/system/$file" ) && -z $drops ]] || return 1
+        done
+    else
+        [[ $action == enable && ! -e $service && ! -L $service && ! -e $timer && ! -L $timer ]] || return 1
+        for file in "$unit.service" "$unit.timer"; do
+            path=$(systemctl show "$file" -p FragmentPath --value 2>/dev/null) || path=''
+            drops=$(systemctl show "$file" -p DropInPaths --value 2>/dev/null) || drops=''
+            [[ -z $path && -z $drops ]] || return 1
+        done
+    fi
+    # Finish an interrupted publication before accepting another version.
+    if [[ -f $pending ]]; then
+        [[ -d $candidate && ! -L $candidate && -O $candidate ]] || return 1
+        mode=$(stat -c %a "$candidate") || return 1; (( (8#$mode & 022)==0 )) || return 1
+        [[ $(find "$candidate" -mindepth 1 -maxdepth 1 | wc -l) == 4 ]] || return 1
+        for file in 2 3 4; do
+            case $file in 2) path=$candidate/manager.sh;; 3) path=$candidate/service;; 4) path=$candidate/timer;; esac
+            [[ -f $path && ! -L $path && -O $path ]] || return 1
+            expected=$(sed -n "${file}p" "$pending")
+            [[ $(sha256sum "$path" | awk '{print $1}') == "$expected" ]] || return 1
+        done
+        [[ -f $candidate/ownership && ! -L $candidate/ownership && -O $candidate/ownership ]] && cmp -s "$candidate/ownership" "$pending" || return 1
+        cne_timer_publish_candidate || return 1
+    fi
+    if [[ $action == disable ]]; then
+        systemctl daemon-reload && systemctl disable --now "$unit.timer" || return 1
+        # Cancel only a deferred retry; an actual in-progress transaction finishes.
+        if [[ $(systemctl show "$unit.service" -p SubState --value) == auto-restart ]]; then systemctl stop "$unit.service" || return 1; fi
+        return 0
+    fi
+    [[ -d $input && ! -L $input ]] || return 1
+    for file in service timer manager.sh; do [[ -f $input/$file && ! -L $input/$file ]] || return 1; done
+    [[ $(head -n 1 "$input/service") == "# Managed by cn-egress-oneclick; owner $identifier" && $(head -n 1 "$input/timer") == "# Managed by cn-egress-oneclick; owner $identifier" ]] || return 1
+    bash -n "$input/manager.sh" || return 1
+    [[ ! -e $candidate && ! -L $candidate ]] || return 1
+    stage=$(mktemp -d /usr/local/lib/.cn-egress-renew.XXXXXXXX) || return 1
+    install -o 0 -g 0 -m 755 "$input/manager.sh" "$stage/manager.sh" && install -o 0 -g 0 -m 644 "$input/service" "$stage/service" && install -o 0 -g 0 -m 644 "$input/timer" "$stage/timer" || { rm -rf "$stage"; return 1; }
+    { printf '%s\n' "$unit"; sha256sum "$stage/manager.sh" "$stage/service" "$stage/timer" | awk '{print $1}'; } > "$stage/ownership" || { rm -rf "$stage"; return 1; }
+    chmod 600 "$stage/ownership" && mkdir -p "$directory" && chmod 755 "$directory" || { rm -rf "$stage"; return 1; }
+    # Publish recovery evidence before any service/program file changes.
+    mv "$stage" "$candidate" || return 1
+    temporary=$(mktemp "$directory/.pending.XXXXXXXX") || return 1
+    cp "$candidate/ownership" "$temporary" && chmod 600 "$temporary" && mv "$temporary" "$pending" || return 1
+    cne_timer_publish_candidate || return 1
+    systemctl daemon-reload && systemctl enable --now "$unit.timer"
+}
+cne_renew_timer_call() {
+    local action=$1 input=${2:-} helper=$CNE_TEMP/renew-timer-helper
+    { printf '#!/usr/bin/env bash\nset -uo pipefail\n'; declare -f cne_renew_timer_root; printf '\ncne_renew_timer_root "$@"\n'; } > "$helper" || return 1
+    cne_root /bin/bash "$helper" "$action" "$CNE_RENEW_TIMER_ID" "$input" || { cne_error '定时维护设置未完成。若存在同名服务、外部修改或额外配置，脚本会停止以保护现有服务。'; return 1; }
+}
+cne_renew_timer_enable() {
+    local directory script=${BASH_SOURCE[0]}
+    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config && cne_renew_timer_id || return 1
+    [[ ! -L $CNE_STATE/auto-renew && ( ! -e $CNE_STATE/auto-renew || -f $CNE_STATE/auto-renew && -O $CNE_STATE/auto-renew ) ]] || { cne_error '自动维护记录不安全，未更改定时任务。'; return 1; }
+    [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { cne_error '自动维护需要运行 systemd 的 Linux 管理机；其他系统可以使用手动续期。'; return 1; }
+    # The source module cannot be installed as a standalone scheduled command.
+    script=${CNE_RUNNING_SCRIPT:-$script}
+    [[ -f $script && ! -L $script && -r $script ]] && grep -Fq 'cne_node_source()' "$script" || { cne_error '请使用发布的单文件脚本设置自动续期。'; return 1; }
+    cne_renew_noninteractive_probe || return 1
+    printf '\n每天检查证书，仅在有效期不足 30 天时续期。不会保存 SSH 或 sudo 密码。\n管理机需保持运行；原来的设备配置保持不变。\n'
+    cne_prompt '启用自动续期（y/N）' N || return 1
+    [[ $CNE_ANSWER == y || $CNE_ANSWER == Y ]] || { printf '已取消。\n'; return 0; }
+    directory=$(mktemp -d "$CNE_TEMP/renew-timer.XXXXXXXX") || return 1
+    cp "$script" "$directory/manager.sh" && cne_renew_timer_files "$directory" && cne_renew_timer_call enable "$directory" || return 1
+    printf '%s\n' "$CNE_RENEW_TIMER_ID" > "$CNE_TEMP/auto-renew" && mv "$CNE_TEMP/auto-renew" "$CNE_STATE/auto-renew" || return 1
+    printf '自动续期已启用。可在本菜单查看状态和日志。\n'
+}
+cne_renew_timer_disable() {
+    cne_renew_timer_id || return 1
+    if [[ ! -e $CNE_STATE/auto-renew && ! -L $CNE_STATE/auto-renew ]]; then printf '当前管理目录未启用自动续期。\n'; return 0; fi
+    [[ -f $CNE_STATE/auto-renew && ! -L $CNE_STATE/auto-renew && -O $CNE_STATE/auto-renew && $(cat "$CNE_STATE/auto-renew") == "$CNE_RENEW_TIMER_ID" ]] || { cne_error '自动维护记录不安全，未更改定时任务。'; return 1; }
+    cne_renew_timer_call disable || return 1
+    rm -f "$CNE_STATE/auto-renew" || return 1
+    printf '自动续期已关闭；已开始的维护会继续完成。\n'
+}
+cne_renew_timer_status() {
+    cne_renew_timer_id || return 1
+    if [[ ! -e $CNE_STATE/auto-renew && ! -L $CNE_STATE/auto-renew ]]; then printf '当前管理目录未启用自动续期。\n'; return 0; fi
+    [[ -f $CNE_STATE/auto-renew && ! -L $CNE_STATE/auto-renew && -O $CNE_STATE/auto-renew && $(cat "$CNE_STATE/auto-renew") == "$CNE_RENEW_TIMER_ID" ]] || { cne_error '自动维护记录不安全。'; return 1; }
+    systemctl --no-pager status "cn-egress-renew-$CNE_RENEW_TIMER_ID.timer" || :
+    journalctl --no-pager -u "cn-egress-renew-$CNE_RENEW_TIMER_ID.service" -n 20 || cne_note '当前用户无权查看系统日志，请使用 sudo journalctl 查看该服务。'
+}
+cne_renew_menu() {
+    while :; do
+        printf '\n证书续期与自动维护\n'; cne_line
+        printf '  1. 立即更新证书\n  2. 启用每天自动检查\n  3. 关闭自动检查\n  4. 查看定时维护状态和日志\n  0. 返回\n'
+        cne_prompt '请选择' || return 0
+        case $CNE_ANSWER in 1) cne_renew_certificates || cne_note '证书更新未完成。';; 2) cne_renew_timer_enable || :;; 3) cne_renew_timer_disable || :;; 4) cne_renew_timer_status || :;; 0) return 0;; *) cne_note '请输入菜单中的编号。';; esac
+    done
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then cne_main "$@"; fi

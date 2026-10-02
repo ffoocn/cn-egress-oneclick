@@ -20,7 +20,7 @@ emit_source() {
     emit_source cne_users_source shell/assets/cn-egress-users.sh
     emit_source cne_probe_source shell/assets/cn-egress-probe.sh
     emit_source cne_restrictions_source shell/assets/restrictions.yaml
-    cat shell/bootstrap.sh shell/awg.sh shell/render.sh shell/controller.sh
+    cat shell/bootstrap.sh shell/download.sh shell/awg.sh shell/render.sh shell/controller.sh shell/backup.sh shell/renew.sh
     printf '\nif [[ ${BASH_SOURCE[0]} == "$0" ]]; then cne_main "$@"; fi\n'
 } > "$temporary"
 bash -n "$temporary"

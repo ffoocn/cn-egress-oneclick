@@ -130,7 +130,7 @@ cne_n_user_transport() {
     printf '%s\n' "$transport"
 }
 cne_n_inspect() {
-    local state=absent role version=unknown service=inactive wan='' user_port='' user_transport
+    local state=absent role version=unknown service=inactive wan='' user_port='' user_transport deployment=none
     cne_n_exists && state=present
     role=$(cne_n_existing_role) || return 1
     if [[ -f /etc/cn-egress/version ]]; then read -r version < /etc/cn-egress/version; [[ $version =~ ^[a-zA-Z0-9._-]+$ ]] || version=unknown; fi
@@ -141,7 +141,9 @@ cne_n_inspect() {
         [[ $user_port =~ ^[0-9]{1,5}$ ]] && ((user_port>=1 && user_port<=65535)) || user_port=''
     fi
     user_transport=$(cne_n_user_transport) || user_transport=unknown
-    printf 'state=%s\nrole=%s\narch=%s\nwan=%s\nforwarding=%s\nservice=%s\nversion=%s\nuser_port=%s\nuser_transport=%s\n' "$state" "$role" "$(uname -m)" "$wan" "$(cne_n_forwarding)" "$service" "$version" "$user_port" "$user_transport"
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    if [[ -f /etc/cn-egress/deployment-id ]]; then deployment=$(cat /etc/cn-egress/deployment-id); [[ $deployment =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || deployment=unknown; fi
+    printf 'state=%s\nrole=%s\narch=%s\nwan=%s\nforwarding=%s\nservice=%s\nversion=%s\nuser_port=%s\nuser_transport=%s\ndeployment=%s\n' "$state" "$role" "$(uname -m)" "$wan" "$(cne_n_forwarding)" "$service" "$version" "$user_port" "$user_transport" "$deployment"
 }
 cne_n_os_check() {
     [[ $(id -u) == 0 ]] || { cne_n_error '需要 root 权限。'; return 1; }
@@ -246,6 +248,25 @@ cne_n_unit_scope_check() {
         done
     done
 }
+cne_n_kernel_fallback() {
+    local name=$1 kind details flags addresses routes
+    case $name in
+        tunl0) kind=ipip;; gre0) kind=gre;; gretap0) kind=gretap;; erspan0) kind=erspan;;
+        ip_vti0) kind=vti;; ip6_vti0) kind=vti6;; sit0) kind=sit;; ip6tnl0) kind=ip6tnl;; ip6gre0) kind=ip6gre;;
+        *) return 1;;
+    esac
+    details=$(ip -n cn-egress-relay -o -d link show dev "$name" 2>/dev/null) || return 1
+    [[ $details == *' state DOWN '* && $details != *' master '* && $details != *' alias '* ]] || return 1
+    flags=${details#*<}; [[ $flags != "$details" ]] || return 1; flags=${flags%%>*}
+    [[ ,$flags, != *,UP,* && ,$flags, != *,LOWER_UP,* ]] || return 1
+    grep -Eq "[[:space:]]$kind([[:space:]]+(any|ip6ip|ip6ip6))?[[:space:]]+remote[[:space:]]+any[[:space:]]+local[[:space:]]+any([[:space:]]|$)" <<< "$details" || return 1
+    addresses=$(ip -n cn-egress-relay -o address show dev "$name" 2>/dev/null) || return 1
+    [[ -z $addresses ]] || return 1
+    routes=$(ip -n cn-egress-relay -4 route show table all dev "$name" 2>/dev/null) || return 1
+    [[ -z $routes ]] || return 1
+    routes=$(ip -n cn-egress-relay -6 route show table all dev "$name" 2>/dev/null) || return 1
+    [[ -z $routes ]]
+}
 cne_n_scope_check() {
     local file name type links role
     while IFS= read -r file; do cne_n_safe_path "/$file" || return 1; done < <(cne_n_all_files)
@@ -255,7 +276,7 @@ cne_n_scope_check() {
         if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx cn-egress-relay; then
             links=$(ip -n cn-egress-relay -o link show 2>/dev/null) || { cne_n_error '无法确认预留网络命名空间的归属。'; return 1; }
             while IFS= read -r name; do
-                case "$name" in lo|cne-users|cne-cn|cne-exit) :;; *) cne_n_error "cn-egress-relay 内含其他网卡 $name，不能覆盖。"; return 1;; esac
+                case "$name" in lo|cne-users|cne-cn|cne-exit) :;; *) cne_n_kernel_fallback "$name" || { cne_n_error "cn-egress-relay 内含其他网卡 ${name}，不能覆盖。"; return 1; };; esac
             done < <(printf '%s\n' "$links" | awk -F': ' '{split($2,a,"@");print a[1]}')
         fi
         for name in cne-users cne-cn cne-exit; do
@@ -466,16 +487,22 @@ cne_n_remove_files() {
     done < <(cne_n_all_files)
 }
 cne_n_validate_backup() {
-    local archive=$1 destination=$2 directory=/root/cn-egress-backups path list verbose count=0 expected node
+    local archive=$1 destination=$2 directory=/root/cn-egress-backups
     [[ $archive == "$directory/"* && ${archive##*/} =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{8}\.tar\.gz$ && ${archive%/*} == "$directory" ]] || { cne_n_error '只能恢复本节点 root 备份目录内的备份。'; return 1; }
     cne_n_safe_path "$archive" || return 1
     [[ -d $directory && -f $archive && ! -L $archive ]] || { cne_n_error '备份不是普通文件。'; return 1; }
     [[ $(stat -c %u "$directory") == 0 && $(stat -c %a "$directory") == 700 && $(stat -c %u "$archive") == 0 && $(stat -c %a "$archive") == 600 && $(stat -c %h "$archive") == 1 ]] || { cne_n_error '备份归属、权限或链接数量不符合要求。'; return 1; }
-    [[ $(stat -c %s "$archive") -le 104857600 ]] || { cne_n_error '备份过大。'; return 1; }
+    cne_n_validate_backup_contents "$archive" "$destination" "${archive##*/}"
+}
+cne_n_validate_backup_contents() {
+    local archive=$1 destination=$2 basename=$3 path list verbose count=0 expected node
+    [[ $basename =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{8}\.tar\.gz$ ]] || { cne_n_error '备份文件名无效。'; return 1; }
+    cne_n_private_upload "$archive" 104857600 || return 1
     list=$(tar -tzf "$archive") && verbose=$(tar -tvzf "$archive") || { cne_n_error '备份无法读取。'; return 1; }
     [[ -n $list && -n $verbose ]] || return 1
     [[ -z $(printf '%s\n' "$list" | sort | uniq -d) ]] || { cne_n_error '备份包含重复路径。'; return 1; }
     if grep -qv '^-' <<< "$verbose"; then cne_n_error '备份仅允许普通文件。'; return 1; fi
+    cne_n_tar_size_check "$verbose" 104857600 || { cne_n_error '备份解压后过大或成员大小无效。'; return 1; }
     while IFS= read -r path; do
         ((count+=1))
         case $path in .cn-egress-backup|.cn-egress-services.tsv) :;; *)
@@ -486,7 +513,7 @@ cne_n_validate_backup() {
     ((count<=60)) || { cne_n_error '备份文件数量异常。'; return 1; }
     printf '%s\n' "$list" | grep -Fxq .cn-egress-backup && printf '%s\n' "$list" | grep -Fxq .cn-egress-services.tsv || { cne_n_error '备份缺少来源和服务状态。'; return 1; }
     node=$(cne_n_backup_node_id) || return 1
-    expected=$(printf 'format=cn-egress-node-backup-v1\narchive=%s\nnode=%s\n' "${archive##*/}" "$node")
+    expected=$(printf 'format=cn-egress-node-backup-v1\narchive=%s\nnode=%s\n' "$basename" "$node")
     [[ $(tar -xOzf "$archive" .cn-egress-backup) == "$expected" ]] || { cne_n_error '备份来源与本节点不匹配。'; return 1; }
     # Validate before extraction, stopping path/link attacks before any mutation.
     tar -xzf "$archive" --no-same-owner -C "$destination" || return 1
@@ -502,7 +529,8 @@ cne_n_validate_backup() {
     fi
 }
 cne_n_restore_apply() {
-    local temporary=$1 file unit state enabled failures=0 marker
+    local temporary=$1 override_id=${2:-} file unit state enabled failures=0 marker
+    [[ -z $override_id || $override_id =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '恢复操作编号无效。'; return 1; }
     cne_n_stop_owned || return 1
     for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
         [[ ! -f /etc/systemd/system/$unit ]] || systemctl disable "$unit" >&2 || failures=1
@@ -518,6 +546,14 @@ cne_n_restore_apply() {
             cne_n_safe_path "/$file" && mkdir -p "/${file%/*}" && cp -p "$temporary/$file" "/$file" || failures=1
         fi
     done < <(cne_n_all_files)
+    # Extraction intentionally assigns ownership to root. Re-establish the
+    # dedicated transport group used by generated unprivileged WSS units.
+    if [[ -f /etc/systemd/system/cn-egress-obfs.service ]] && grep -Eq '^[[:space:]]*User[[:space:]]*=[[:space:]]*cn-egress-wss[[:space:]]*$' /etc/systemd/system/cn-egress-obfs.service; then
+        cne_n_transport_user || failures=1
+        while IFS= read -r file; do
+            case $file in etc/cn-egress-wss/*) [[ ! -f /$file ]] || chown root:cn-egress-wss "/$file" || failures=1;; esac
+        done < <(cne_n_all_files)
+    fi
     systemctl daemon-reload >&2 || failures=1
     cne_n_scope_check || { cne_n_error '恢复后的服务归属检查未通过，未启动服务。'; return 1; }
     while IFS=$'\t' read -r unit state enabled; do
@@ -528,8 +564,24 @@ cne_n_restore_apply() {
         [[ -f /etc/systemd/system/$unit ]] || continue
         if awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv"; then systemctl start "$unit" >&2 || failures=1; fi
     done
+    # Starting the main unit also starts Wants/Requires dependencies. Enforce
+    # archived stopped states after these implicit starts, particularly obfs.
+    for unit in cn-egress-dns.service cn-egress-obfs.service cn-egress.service cn-egress-users.service; do
+        [[ -f /etc/systemd/system/$unit ]] || continue
+        if ! awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv" && systemctl is-active --quiet "$unit"; then
+            systemctl stop "$unit" >&2 || failures=1
+        fi
+    done
+    for unit in cn-egress-users.service cn-egress.service cn-egress-obfs.service cn-egress-dns.service; do
+        [[ -f /etc/systemd/system/$unit ]] || continue
+        if awk -F'\t' -v u="$unit" '$1==u && $2=="active"{found=1}END{exit !found}' "$temporary/.cn-egress-services.tsv"; then
+            systemctl is-active --quiet "$unit" || failures=1
+        fi
+    done
     ((failures==0)) || { cne_n_error '恢复未完全成功，请保留备份并检查本工具服务。'; return 1; }
-    if [[ -f $temporary/etc/cn-egress/deployment-id ]]; then
+    if [[ -n $override_id ]]; then
+        cne_n_deployment_mark "$override_id" || return 1
+    elif [[ -f $temporary/etc/cn-egress/deployment-id ]]; then
         mkdir -p /etc/cn-egress || return 1
         marker=$(mktemp /etc/cn-egress/.deployment.XXXXXXXX) || return 1
         if ! cp "$temporary/etc/cn-egress/deployment-id" "$marker" || ! chmod 600 "$marker" || ! mv "$marker" /etc/cn-egress/deployment-id; then rm -f "$marker"; return 1; fi
@@ -561,6 +613,230 @@ cne_n_restore() {
 }
 cne_n_rollback() {
     cne_n_restore "$1"
+}
+cne_n_private_upload() {
+    local file=$1 maximum=$2 size
+    cne_n_safe_path "$file" || return 1
+    [[ -f $file && ! -L $file && $(stat -c %u "$file") == 0 && $(stat -c %a "$file") == 600 && $(stat -c %h "$file") == 1 ]] || { cne_n_error '上传文件必须是 root 私有普通文件，不能包含链接。'; return 1; }
+    size=$(stat -c %s "$file") || return 1
+    [[ $size =~ ^[0-9]+$ ]] && ((size>0 && size<=maximum)) || { cne_n_error '上传文件为空或过大。'; return 1; }
+}
+cne_n_tar_size_check() {
+    # GNU tar uses mode,owner/group,size; BSD tar additionally prints a link
+    # count and separate owner/group columns. Both list ordinary files here.
+    LC_ALL=C awk -v maximum="$2" '{size=$3;if($2~/^[0-9]+$/ && $5~/^[0-9]+$/)size=$5;if(size!~/^[0-9]+$/)bad=1;total+=size}END{exit bad || total>maximum}' <<< "$1"
+}
+cne_n_deployment_read() {
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    if [[ ! -f /etc/cn-egress/deployment-id ]]; then printf 'none\n'; return; fi
+    local deployment
+    deployment=$(cat /etc/cn-egress/deployment-id) || return 1
+    [[ $deployment =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '现有部署编号无效。'; return 1; }
+    printf '%s\n' "$deployment"
+}
+cne_n_deployment_mark() {
+    local operation=$1 marker
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '维护操作编号无效。'; return 1; }
+    cne_n_safe_path /etc/cn-egress/deployment-id || return 1
+    mkdir -p /etc/cn-egress || return 1
+    marker=$(mktemp /etc/cn-egress/.deployment.XXXXXXXX) || return 1
+    if ! printf '%s\n' "$operation" > "$marker" || ! chmod 600 "$marker" || ! mv "$marker" /etc/cn-egress/deployment-id; then rm -f "$marker"; return 1; fi
+}
+cne_n_maintenance_guard() {
+    local role=$1 expected=$2 absent=${3:-} current unit transport
+    [[ $expected == none || $expected =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '预期部署编号无效。'; return 1; }
+    cne_n_scope_check || return 1
+    if cne_n_exists; then
+        cne_n_require_role "$role" || { cne_n_error '维护要求本节点已有同角色的本工具部署。'; return 1; }
+        [[ -f /etc/cn-egress/role && -f /etc/cn-egress-wss/role ]] || { cne_n_error '节点部署不完整，不能进行维护，请先修复安装。'; return 1; }
+        transport=$(cne_n_user_transport) || return 1
+        for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
+            [[ $unit != cn-egress-dns.service || $role == exit ]] || continue
+            [[ $unit != cn-egress-users.service || ( $role == hk && $transport == awg2 ) ]] || continue
+            [[ -f /etc/systemd/system/$unit ]] || { cne_n_error "节点部署缺少服务 ${unit}，请先修复安装。"; return 1; }
+        done
+    elif [[ $absent != allow-absent || $expected != none ]]; then
+        cne_n_error '维护要求本节点已有同角色的本工具部署。'; return 1
+    fi
+    current=$(cne_n_deployment_read) || return 1
+    [[ $current == "$expected" ]] || { cne_n_error '节点部署已改变，请重新检查后再操作。'; return 1; }
+}
+cne_n_config_records() {
+    local mode=${1:-config} file hash
+    while IFS= read -r file; do
+        case $file in
+            etc/cn-egress/deployment-id) continue;;
+            etc/cn-egress-wss/ca.crt|etc/cn-egress-wss/node.crt|etc/cn-egress-wss/node.key) [[ $mode == tls ]] || continue;;
+            *) [[ $mode != tls ]] || continue;;
+        esac
+        cne_n_safe_path "/$file" || return 1
+        if [[ -f /$file ]]; then
+            hash=$(sha256sum "/$file") || return 1
+            printf '%s\t%s\n' "$file" "${hash%% *}"
+        else printf '%s\tabsent\n' "$file"; fi
+    done < <(cne_n_all_files)
+}
+cne_n_config_fingerprint() {
+    local mode=${1:-config} records
+    records=$(cne_n_config_records "$mode") || return 1
+    printf '%s\n' "$records" | sha256sum | awk '{print $1}'
+}
+cne_n_maintenance_info() {
+    local role=$1 state=absent actual=unknown deployment=none ca=none host=none config tls unit label active enabled cert_due=1 ca_due=1
+    cne_n_scope_check || return 1
+    if cne_n_exists; then
+        state=present; actual=$(cne_n_existing_role) || return 1
+        [[ $actual == "$role" ]] || { cne_n_error '节点角色与维护配置不符。'; return 1; }
+        deployment=$(cne_n_deployment_read) || return 1
+    fi
+    cne_n_safe_path /etc/cn-egress-wss/ca.crt && cne_n_safe_path /etc/cn-egress-wss/sh-host || return 1
+    if [[ -f /etc/cn-egress-wss/ca.crt ]]; then ca=$(sha256sum /etc/cn-egress-wss/ca.crt) || return 1; ca=${ca%% *}; fi
+    if [[ -f /etc/cn-egress-wss/sh-host ]]; then
+        host=$(cat /etc/cn-egress-wss/sh-host) || return 1
+        [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ${#host} -le 253 ]] || { cne_n_error '现有传输主机地址无效。'; return 1; }
+    fi
+    config=$(cne_n_config_fingerprint config) && tls=$(cne_n_config_fingerprint tls) || return 1
+    cne_n_safe_path /etc/cn-egress-wss/node.crt || return 1
+    openssl x509 -in /etc/cn-egress-wss/node.crt -noout -checkend 2592000 >/dev/null 2>&1 && cert_due=0
+    openssl x509 -in /etc/cn-egress-wss/ca.crt -noout -checkend 2592000 >/dev/null 2>&1 && ca_due=0
+    printf 'state=%s\nrole=%s\ndeployment=%s\nca_sha256=%s\nconfig_sha256=%s\ntls_sha256=%s\nwss_host=%s\ncert_due=%s\nca_due=%s\n' "$state" "$actual" "$deployment" "$ca" "$config" "$tls" "$host" "$cert_due" "$ca_due"
+    for label in main obfs dns users; do
+        case $label in main) unit=cn-egress.service;; *) unit="cn-egress-$label.service";; esac
+        active=$(systemctl is-active "$unit" 2>/dev/null) || :
+        enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || :
+        [[ $active =~ ^(active|inactive|failed|activating|deactivating|reloading|maintenance|refreshing|unknown)$ ]] || active=inactive
+        [[ $enabled =~ ^(enabled|enabled-runtime|disabled|static|indirect|generated|masked|masked-runtime|transient|linked|linked-runtime|alias|bad|not-found|unknown)$ ]] || enabled=not-found
+        printf '%s_active=%s\n%s_enabled=%s\n' "$label" "$active" "$label" "$enabled"
+    done
+}
+cne_n_backup_export() {
+    local role=$1 archive=$2 stage
+    cne_n_scope_check && cne_n_backup_directory || return 1
+    stage=$(mktemp -d /root/cn-egress-backups/.export.XXXXXXXX) || return 1
+    if ! cne_n_validate_backup "$archive" "$stage"; then rm -rf "$stage"; return 1; fi
+    if [[ -f $stage/etc/cn-egress/role && $(cat "$stage/etc/cn-egress/role") != "$role" ]]; then rm -rf "$stage"; cne_n_error '备份节点角色与请求不符。'; return 1; fi
+    rm -rf "$stage"
+    base64 < "$archive"
+}
+cne_n_restore_target_check() (
+    local stage=$1 role=$2 unit file content transport=wireguard wan mode
+    [[ -f $stage/etc/cn-egress/role && $(cat "$stage/etc/cn-egress/role") == "$role" && -f $stage/etc/cn-egress-wss/role && $(cat "$stage/etc/cn-egress-wss/role") == "$role" ]] || { cne_n_error '历史恢复需要同角色的完整部署备份，不能恢复为空节点。'; exit 1; }
+    if [[ -f $stage/etc/cn-egress/user-transport ]]; then transport=$(cat "$stage/etc/cn-egress/user-transport"); fi
+    [[ $transport == wireguard || ( $role == hk && $transport == awg2 ) ]] || { cne_n_error '备份客户端传输类型无效。'; exit 1; }
+    cne_n_user_transport() { printf '%s\n' "$transport"; }
+    while IFS= read -r file; do
+        [[ -f $stage/$file ]] || continue
+        mode=$(stat -c %a "$stage/$file") || exit 1
+        [[ $(stat -c %u "$stage/$file") == 0 && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022)==0 )) || { cne_n_error "历史备份文件可被其他用户修改：$file"; exit 1; }
+    done < <(cne_n_all_files)
+    for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
+        file="$stage/etc/systemd/system/$unit"
+        if [[ -f $file ]]; then cne_n_unit_file_check "$file" "$unit" "$role" || exit 1
+        elif [[ $unit == cn-egress.service || $unit == cn-egress-obfs.service || ( $unit == cn-egress-dns.service && $role == exit ) || ( $unit == cn-egress-users.service && $role == hk && $transport == awg2 ) ]]; then
+            cne_n_error "历史备份服务缺失：$unit"; exit 1
+        fi
+    done
+    for file in obfs.conf users.conf; do
+        [[ -f $stage/etc/systemd/system/cn-egress.service.d/$file ]] || continue
+        content=$(sed -E '/^[[:space:]]*([#;]|$)/d; s/^[[:space:]]+//; s/[[:space:]]+$//' "$stage/etc/systemd/system/cn-egress.service.d/$file") || exit 1
+        case $file in
+            obfs.conf) [[ $content == $'[Unit]\nWants=cn-egress-obfs.service\nAfter=cn-egress-obfs.service' ]] || exit 1;;
+            users.conf) [[ $role == hk && $transport == awg2 && ( $content == $'[Unit]\nRequires=cn-egress-users.service\nBindsTo=cn-egress-users.service\nAfter=cn-egress-users.service' || $content == $'[Unit]\nRequires=cn-egress-users.service\nAfter=cn-egress-users.service' ) ]] || exit 1;;
+        esac
+    done
+    if [[ $role == exit ]]; then
+        [[ -f $stage/etc/cn-egress/wan-interface ]] || { cne_n_error '出口备份缺少上联网卡。'; exit 1; }
+        wan=$(cne_n_wan) || exit 1
+        [[ -n $wan && $(cat "$stage/etc/cn-egress/wan-interface") == "$wan" ]] || { cne_n_error '出口上联网卡已改变，不能直接恢复该备份。'; exit 1; }
+    fi
+)
+cne_n_restore_import() {
+    local role=$1 upload=$2 basename=$3 expected=$4 operation=$5 stage archive incoming
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '恢复操作编号无效。'; return 1; }
+    cne_n_maintenance_guard "$role" "$expected" allow-absent && cne_n_private_upload "$upload" 104857600 || return 1
+    cne_n_backup_directory || return 1
+    stage=$(mktemp -d /root/cn-egress-backups/.import.XXXXXXXX) || return 1
+    if ! cne_n_validate_backup_contents "$upload" "$stage" "$basename" || ! cne_n_restore_target_check "$stage" "$role"; then rm -rf "$stage"; return 1; fi
+    archive="/root/cn-egress-backups/$basename"
+    cne_n_safe_path "$archive" || { rm -rf "$stage"; return 1; }
+    if [[ -f $archive ]]; then
+        if ! cne_n_private_upload "$archive" 104857600 || ! cmp -s "$upload" "$archive"; then rm -rf "$stage"; cne_n_error '本节点已有同名但内容不同的备份，已停止。'; return 1; fi
+    else
+        incoming=$(mktemp /root/cn-egress-backups/.incoming.XXXXXXXX) || { rm -rf "$stage"; return 1; }
+        if ! cp "$upload" "$incoming" || ! chmod 600 "$incoming" || ! mv "$incoming" "$archive"; then rm -f "$incoming"; rm -rf "$stage"; return 1; fi
+    fi
+    # Re-check identity while still holding the node lock, then keep this operation
+    # identity throughout a partial restore so the manager can undo every node.
+    if ! cne_n_maintenance_guard "$role" "$expected" allow-absent || ! cne_n_deployment_mark "$operation"; then rm -rf "$stage"; return 1; fi
+    if ! cne_n_restore_apply "$stage" "$operation"; then rm -rf "$stage"; return 1; fi
+    rm -rf "$stage"
+    printf '历史备份已恢复。\n'
+}
+cne_n_certificate_validate() {
+    local role=$1 archive=$2 stage=$3 list verbose host purpose usage key_public cert_public ca_public subject
+    cne_n_private_upload "$archive" 65536 || return 1
+    list=$(tar -tzf "$archive") && verbose=$(tar -tvzf "$archive") || { cne_n_error '证书更新包无法读取。'; return 1; }
+    [[ $(printf '%s\n' "$list" | LC_ALL=C sort) == $'ca.crt\nnode.crt\nnode.key' ]] && ! grep -qv '^-' <<< "$verbose" || { cne_n_error '证书更新包只允许 ca.crt、node.crt、node.key 三个普通文件。'; return 1; }
+    cne_n_tar_size_check "$verbose" 65536 || { cne_n_error '证书更新包解压后过大。'; return 1; }
+    tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$stage" || return 1
+    for subject in ca.crt node.crt; do
+        [[ $(awk '/-----BEGIN CERTIFICATE-----/{n++}END{print n+0}' "$stage/$subject") == 1 ]] && ! grep -q 'PRIVATE KEY' "$stage/$subject" && openssl x509 -in "$stage/$subject" -noout -checkend 2592000 >/dev/null 2>&1 || { cne_n_error '证书无效、包含私钥或将在 30 天内到期。'; return 1; }
+    done
+    subject=$(openssl x509 -in "$stage/ca.crt" -noout -ext basicConstraints 2>/dev/null) || return 1
+    [[ $subject == *'CA:TRUE'* ]] || { cne_n_error '更新包中的 CA 不是有效 CA 证书。'; return 1; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -ext basicConstraints 2>/dev/null) || return 1
+    [[ $subject == *'CA:FALSE'* ]] || { cne_n_error '节点证书不能作为 CA 使用。'; return 1; }
+    key_public=$(openssl pkey -in "$stage/node.key" -passin pass: -pubout 2>/dev/null) || { cne_n_error '节点私钥无效，不能使用加密或损坏的私钥。'; return 1; }
+    cert_public=$(openssl x509 -in "$stage/node.crt" -pubkey -noout 2>/dev/null) || return 1
+    [[ $key_public == "$cert_public" ]] || { cne_n_error '证书与节点私钥不匹配。'; return 1; }
+    ca_public=$(openssl x509 -in "$stage/ca.crt" -pubkey -noout 2>/dev/null) || return 1
+    [[ $key_public != "$ca_public" ]] || { cne_n_error '节点私钥不能与 CA 私钥相同。'; return 1; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
+    [[ $subject == "subject=CN=cn-egress-$role" || $subject == "subject= CN=cn-egress-$role" ]] || { cne_n_error '节点证书角色不符。'; return 1; }
+    purpose=sslclient; usage='TLS Web Client Authentication'
+    [[ $role != sh ]] || { purpose=sslserver; usage='TLS Web Server Authentication'; }
+    subject=$(openssl x509 -in "$stage/node.crt" -noout -ext extendedKeyUsage 2>/dev/null | tail -n +2 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || return 1
+    [[ $subject == "$usage" ]] || { cne_n_error '节点证书用途与角色不符。'; return 1; }
+    openssl verify -CAfile "$stage/ca.crt" -check_ss_sig "$stage/ca.crt" >/dev/null 2>&1 && openssl verify -CAfile "$stage/ca.crt" -purpose "$purpose" "$stage/node.crt" >/dev/null 2>&1 || { cne_n_error '证书 CA 或签名链无效。'; return 1; }
+    if [[ $role == sh ]]; then
+        cne_n_safe_path /etc/cn-egress-wss/sh-host || return 1
+        host=$(cat /etc/cn-egress-wss/sh-host) || return 1
+        [[ $host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ${#host} -le 253 ]] || return 1
+        if [[ $host =~ ^[0-9.]+$ ]]; then
+            openssl verify -CAfile "$stage/ca.crt" -purpose sslserver -verify_ip "$host" "$stage/node.crt" >/dev/null 2>&1
+        else openssl verify -CAfile "$stage/ca.crt" -purpose sslserver -verify_hostname "$host" "$stage/node.crt" >/dev/null 2>&1; fi || { cne_n_error '大陆中转证书不包含当前传输地址。'; return 1; }
+    fi
+}
+cne_n_certificate_apply() {
+    local role=$1 archive=$2 expected=$3 operation=$4 stage file destination replacement active enabled mode
+    [[ $operation =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '证书更新操作编号无效。'; return 1; }
+    cne_n_maintenance_guard "$role" "$expected" || return 1
+    for file in ca.crt node.crt node.key; do
+        destination="/etc/cn-egress-wss/$file"
+        cne_n_safe_path "$destination" || return 1
+        [[ -f $destination && $(stat -c %u "$destination") == 0 ]] || { cne_n_error '现有证书文件归属无效或缺失。'; return 1; }
+        mode=$(stat -c %a "$destination") || return 1
+        [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022)==0 )) || { cne_n_error '现有证书可被其他用户修改。'; return 1; }
+    done
+    stage=$(mktemp -d /etc/cn-egress-wss/.renew.XXXXXXXX) || return 1
+    if ! cne_n_certificate_validate "$role" "$archive" "$stage"; then rm -rf "$stage"; return 1; fi
+    active=$(systemctl is-active cn-egress-obfs.service 2>/dev/null) || :
+    enabled=$(systemctl is-enabled cn-egress-obfs.service 2>/dev/null) || :
+    [[ $active == active || $active == inactive || $active == failed ]] || { rm -rf "$stage"; cne_n_error '传输服务正在切换状态，请稍后重试。'; return 1; }
+    systemctl daemon-reload >&2 && cne_n_maintenance_guard "$role" "$expected" || { rm -rf "$stage"; return 1; }
+    cne_n_deployment_mark "$operation" || { rm -rf "$stage"; return 1; }
+    if [[ $active == active ]]; then systemctl stop cn-egress-obfs.service >&2 || { rm -rf "$stage"; return 1; }; fi
+    for file in ca.crt node.crt node.key; do
+        destination="/etc/cn-egress-wss/$file"
+        replacement=$(mktemp /etc/cn-egress-wss/.certificate.XXXXXXXX) || { rm -rf "$stage"; return 1; }
+        # Preserve the existing certificate permissions and transport group while
+        # publishing each file atomically. WireGuard/AWG configuration is untouched.
+        if ! cp -p "$destination" "$replacement" || ! cat "$stage/$file" > "$replacement" || ! mv "$replacement" "$destination"; then rm -f "$replacement"; rm -rf "$stage"; return 1; fi
+    done
+    rm -rf "$stage"
+    if [[ $active == active ]]; then systemctl start cn-egress-obfs.service >&2 && systemctl is-active --quiet cn-egress-obfs.service || return 1; fi
+    [[ $(systemctl is-enabled cn-egress-obfs.service 2>/dev/null || :) == "$enabled" ]] || { cne_n_error '传输服务启用状态已改变，更新未完成。'; return 1; }
+    printf '传输证书已更新，设备配置保持不变。\n'
 }
 cne_n_validate_archive() {
     local role=$1 archive=$2 destination=$3 list verbose path number
@@ -673,7 +949,7 @@ cne_n_install_apply() {
     chmod 755 /opt/cn-egress /opt/cn-egress/wstunnel-11.0.0 || return 1
     [[ ! -d /opt/cn-egress/awg-0.2.16 ]] || chmod 755 /opt/cn-egress/awg-0.2.16 || return 1
     printf '%s\n' "$role" > /etc/cn-egress/role || return 1
-    printf '2.1.1\n' > /etc/cn-egress/version || return 1
+    printf '2.2.0\n' > /etc/cn-egress/version || return 1
     chmod 600 /etc/cn-egress/{role,version,deployment-id} || return 1
     systemctl daemon-reload >&2 || return 1
     cne_n_scope_check || return 1
@@ -714,7 +990,7 @@ cne_n_install() {
 cne_n_require_role() {
     local role=$1 actual
     actual=$(cne_n_existing_role) || return 1
-    [[ $actual == "$role" ]] || { cne_n_error "当前节点角色为 $actual，期望 $role。请选择备份后覆盖安装以修复不完整配置。"; return 1; }
+    [[ $actual == "$role" ]] || { cne_n_error "当前节点角色为 ${actual}，期望 ${role}。请选择备份后覆盖安装以修复不完整配置。"; return 1; }
 }
 cne_n_net() { local role=$1; shift; if [[ $role == hk || $role == sh ]]; then ip netns exec cn-egress-relay "$@"; else "$@"; fi; }
 cne_n_status() {
@@ -1068,10 +1344,14 @@ cne_n_dispatch() {
     local action=$1 role=$2; shift 2
     case $action in
         inspect) cne_n_inspect;;
+        maintenance-info) (($#==0)) || return 2; cne_n_maintenance_info "$role";;
         preflight) cne_n_preflight "$role" "$@";;
         prepare) cne_n_prepare "$role" "${1:-wireguard}";;
         backup) cne_n_scope_check && cne_n_backup;;
+        backup-export) (($#==1)) || return 2; cne_n_backup_export "$role" "$@";;
         restore) (($#>=1 && $#<=2)) || return 2; cne_n_restore "$@";;
+        restore-import) (($#==4)) || return 2; cne_n_restore_import "$role" "$@";;
+        certificate-apply) (($#==3)) || return 2; cne_n_certificate_apply "$role" "$@";;
         install) (($#==3)) || return 2; cne_n_install "$role" "$@";;
         status) cne_n_status "$role";;
         doctor) cne_n_doctor "$role";;
