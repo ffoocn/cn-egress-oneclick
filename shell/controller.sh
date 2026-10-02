@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.1.0
+CNE_VERSION=2.1.1
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -91,8 +91,13 @@ cne_initialize() {
 cne_cleanup() {
     if [[ ${CNE_TRANSACTION_ACTIVE:-0} == 1 ]]; then cne_transaction_abort || :; fi
     CNE_PASSWORDS=(); CNE_SUDOS=(); unset CNE_ANSWER
-    if [[ -n ${CNE_TEMP:-} && $CNE_TEMP == "$CNE_STATE"/.session.* && -d $CNE_TEMP && ! -L $CNE_TEMP ]]; then
-        rm -rf -- "$CNE_TEMP"
+    if [[ -n ${CNE_TEMP:-} && $CNE_TEMP == "$CNE_STATE"/.session.* && -d $CNE_TEMP && ! -L $CNE_TEMP && -O $CNE_TEMP ]]; then
+        # Failed Go builds can leave read-only modules in this private session.
+        # Recursive chmod does not follow symlinks encountered in the tree.
+        if ! chmod -R u+w "$CNE_TEMP" || ! rm -rf -- "$CNE_TEMP"; then
+            cne_note "临时目录未能清理：$CNE_TEMP。请保密其中的临时文件。"
+            return 1
+        fi
     fi
 }
 cne_load_config() {

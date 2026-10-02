@@ -46,7 +46,10 @@ mock_setup() {
     cne_bootstrap() { return 0; }
     cne_authenticate() { printf 'authenticate %s\n' "$1" >> "$MOCK_TRACE"; }
     # Production targets GNU chmod on Linux; preserve its effect on the macOS test host.
-    chmod() { [[ $# == 3 && $1 == 700 && $2 == -- ]] || fail 'unexpected chmod operation'; command chmod "$1" "$3"; }
+    chmod() {
+        if [[ $# == 3 && $1 == -R && $2 == u+w && $3 == "$CNE_TEMP" ]]; then command chmod "$@"
+        else [[ $# == 3 && $1 == 700 && $2 == -- ]] || fail 'unexpected chmod operation'; command chmod "$1" "$3"; fi
+    }
     cne_inspect_all() {
         local idx
         printf 'inspect\n' >> "$MOCK_TRACE"

@@ -679,7 +679,7 @@ cne_n_install_apply() {
     chmod 755 /opt/cn-egress /opt/cn-egress/wstunnel-11.0.0 || return 1
     [[ ! -d /opt/cn-egress/awg-0.2.16 ]] || chmod 755 /opt/cn-egress/awg-0.2.16 || return 1
     printf '%s\n' "$role" > /etc/cn-egress/role || return 1
-    printf '2.1.0\n' > /etc/cn-egress/version || return 1
+    printf '2.1.1\n' > /etc/cn-egress/version || return 1
     chmod 600 /etc/cn-egress/{role,version,deployment-id} || return 1
     systemctl daemon-reload >&2 || return 1
     cne_n_scope_check || return 1
@@ -1687,6 +1687,14 @@ cne_awg_arch() {
     case $1 in x86_64|amd64) printf 'amd64\n';; aarch64|arm64) printf 'arm64\n';; *) return 1;; esac
 }
 
+# Go extracts its module cache with read-only directories. A non-root manager
+# must regain owner write permission before deleting its private build tree.
+cne_awg_cleanup() {
+    local work=$1
+    [[ $work == "$CNE_TEMP"/awg-build.* && -d $work && ! -L $work && -O $work ]] || { cne_error '拒绝清理管理会话之外的编译目录。'; return 1; }
+    chmod -R u+w "$work" && rm -rf -- "$work"
+}
+
 # URL SHA256 CACHE_FILE; publish only a completely verified download.
 cne_awg_download() {
     local url=$1 checksum=$2 archive=$3 temporary actual
@@ -1745,13 +1753,13 @@ cne_fetch_awg() {
         GOPRIVATE= GONOSUMDB= GONOPROXY= GOINSECURE= GOCACHE="$work/gocache" \
         GOMODCACHE="$work/gomodcache" GOPROXY=https://proxy.golang.org \
         GOSUMDB=sum.golang.org "$work/go/bin/go" build -mod=readonly -trimpath \
-        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
+        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
     chmod 755 "$work/amneziawg-go" || return 1
     existing=$(sha256sum "$work/amneziawg-go" | awk '{print $1}') || return 1
     printf '%s\n' "$existing" > "$work/engine.sha256" || return 1
     mv "$work/amneziawg-go" "$engine" && mv "$work/engine.sha256" "$digest" || return 1
     CNE_AWG_ENGINE=$engine; CNE_AWG_TOOLS_SOURCE=$tools_archive
-    rm -rf -- "$work"
+    cne_awg_cleanup "$work"
 }
 #!/usr/bin/env bash
 # Pure Bash configuration renderer. Sourcing this file has no side effects.
@@ -2207,7 +2215,7 @@ EOF
 )
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.1.0
+CNE_VERSION=2.1.1
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -2298,8 +2306,13 @@ cne_initialize() {
 cne_cleanup() {
     if [[ ${CNE_TRANSACTION_ACTIVE:-0} == 1 ]]; then cne_transaction_abort || :; fi
     CNE_PASSWORDS=(); CNE_SUDOS=(); unset CNE_ANSWER
-    if [[ -n ${CNE_TEMP:-} && $CNE_TEMP == "$CNE_STATE"/.session.* && -d $CNE_TEMP && ! -L $CNE_TEMP ]]; then
-        rm -rf -- "$CNE_TEMP"
+    if [[ -n ${CNE_TEMP:-} && $CNE_TEMP == "$CNE_STATE"/.session.* && -d $CNE_TEMP && ! -L $CNE_TEMP && -O $CNE_TEMP ]]; then
+        # Failed Go builds can leave read-only modules in this private session.
+        # Recursive chmod does not follow symlinks encountered in the tree.
+        if ! chmod -R u+w "$CNE_TEMP" || ! rm -rf -- "$CNE_TEMP"; then
+            cne_note "临时目录未能清理：$CNE_TEMP。请保密其中的临时文件。"
+            return 1
+        fi
     fi
 }
 cne_load_config() {

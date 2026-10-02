@@ -10,6 +10,14 @@ cne_awg_arch() {
     case $1 in x86_64|amd64) printf 'amd64\n';; aarch64|arm64) printf 'arm64\n';; *) return 1;; esac
 }
 
+# Go extracts its module cache with read-only directories. A non-root manager
+# must regain owner write permission before deleting its private build tree.
+cne_awg_cleanup() {
+    local work=$1
+    [[ $work == "$CNE_TEMP"/awg-build.* && -d $work && ! -L $work && -O $work ]] || { cne_error '拒绝清理管理会话之外的编译目录。'; return 1; }
+    chmod -R u+w "$work" && rm -rf -- "$work"
+}
+
 # URL SHA256 CACHE_FILE; publish only a completely verified download.
 cne_awg_download() {
     local url=$1 checksum=$2 archive=$3 temporary actual
@@ -68,11 +76,11 @@ cne_fetch_awg() {
         GOPRIVATE= GONOSUMDB= GONOPROXY= GOINSECURE= GOCACHE="$work/gocache" \
         GOMODCACHE="$work/gomodcache" GOPROXY=https://proxy.golang.org \
         GOSUMDB=sum.golang.org "$work/go/bin/go" build -mod=readonly -trimpath \
-        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
+        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请检查上述错误和网络后重试。'; return 1; }
     chmod 755 "$work/amneziawg-go" || return 1
     existing=$(sha256sum "$work/amneziawg-go" | awk '{print $1}') || return 1
     printf '%s\n' "$existing" > "$work/engine.sha256" || return 1
     mv "$work/amneziawg-go" "$engine" && mv "$work/engine.sha256" "$digest" || return 1
     CNE_AWG_ENGINE=$engine; CNE_AWG_TOOLS_SOURCE=$tools_archive
-    rm -rf -- "$work"
+    cne_awg_cleanup "$work"
 }
