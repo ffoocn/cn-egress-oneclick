@@ -28,15 +28,77 @@ cne_render_port() {
 
 cne_render_key() { [[ $1 =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]]; }
 
-# FILE ADDRESS PRIVATE_KEY SERVER_PUBLIC_KEY PSK HK_HOST USER_PORT
+# Validate and normalize the complete shared AWG2 block without evaluating it.
+cne_render_awg_params() (
+    local file=$1 line key value seen=' ' count=0 minimum='' maximum='' index other start end
+    local starts=() ends=()
+    [[ -f $file && ! -L $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^(Jc|Jmin|Jmax|S[1-4]|H[1-4])[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]] || return 1
+        key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+        [[ $seen != *" $key "* ]] || return 1
+        seen+="$key "; count=$((count+1))
+        case $key in
+            H*)
+                [[ $value =~ ^([1-9][0-9]{0,9})(-([1-9][0-9]{0,9}))?$ ]] || return 1
+                start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[3]:-$start}
+                (( start <= end && end <= 4294967295 )) || return 1
+                index=${key#H}; starts[$index]=$start; ends[$index]=$end
+                ;;
+            *)
+                [[ $value =~ ^(0|[1-9][0-9]{0,3})$ ]] || return 1
+                case $key in
+                    Jc) (( value <= 12 )) || return 1;;
+                    Jmin) (( value >= 1 && value < 1400 )) || return 1; minimum=$value;;
+                    Jmax) (( value >= 1 && value < 1400 )) || return 1; maximum=$value;;
+                    S*) (( value >= 1 && value <= 128 )) || return 1;;
+                esac
+                ;;
+        esac
+    done < "$file"
+    [[ $count == 11 ]] && (( minimum <= maximum )) || return 1
+    for index in 1 2 3 4; do
+        for other in 1 2 3 4; do
+            (( index >= other )) && continue
+            (( ends[index] < starts[other] || ends[other] < starts[index] )) || return 1
+        done
+    done
+    # Only the validated data block is passed to awg and client importers.
+    cat "$file"
+)
+
+cne_render_awg_generate() {
+    local index random start
+    printf 'Jc = 6\nJmin = 40\nJmax = 700\n'
+    for index in 1 2 3 4; do
+        random=$(openssl rand -hex 4) || return 1
+        case $index in
+            1|2) printf 'S%s = %s\n' "$index" "$((16#$random % 49 + 32))";;
+            3) printf 'S3 = %s\n' "$((16#$random % 17 + 16))";;
+            4) printf 'S4 = %s\n' "$((16#$random % 9 + 8))";;
+        esac
+    done
+    for index in 1 2 3 4; do
+        random=$(openssl rand -hex 4) || return 1
+        start=$(( (index-1) * 1000000000 + 100000000 + 16#$random % 600000000 ))
+        printf 'H%s = %s-%s\n' "$index" "$start" "$((start+1023))"
+    done
+}
+
+# FILE ADDRESS PRIVATE_KEY SERVER_PUBLIC_KEY PSK HK_HOST USER_PORT [MODE PARAM_FILE]
 cne_render_client() (
     set -euo pipefail
     umask 077
-    local file=$1 number=$2 private=$3 public=$4 psk=$5 host=$6 port=$7
-    [[ $number =~ ^[0-9]{1,3}$ ]] && (( 10#$number >= 2 && 10#$number <= 249 )) || { cne_render_error '客户端地址须为 2 到 249'; exit 1; }
+    local file=$1 number=$2 private=$3 public=$4 psk=$5 host=$6 port=$7 mode=${8:-wireguard} params=${9:-} block=''
+    [[ $number =~ ^[0-9]{1,3}$ ]] && (( 10#$number >= 2 && 10#$number <= 250 )) || { cne_render_error '客户端地址须为 2 到 250（250 保留给诊断）'; exit 1; }
     number=$((10#$number))
     cne_render_key "$private" && cne_render_key "$public" && cne_render_key "$psk" || { cne_render_error 'WireGuard 密钥格式无效'; exit 1; }
     cne_render_host "$host" && cne_render_port "$port" || { cne_render_error '香港地址或端口无效'; exit 1; }
+    case $mode in
+        wireguard) ;;
+        awg2) block=$(cne_render_awg_params "$params") || { cne_render_error 'AmneziaWG 参数无效'; exit 1; };;
+        *) cne_render_error '入口协议无效'; exit 1;;
+    esac
     [[ ! -e $file && ! -L $file ]] || { cne_render_error '客户端配置已存在'; exit 1; }
     set -o noclobber
     cat > "$file" <<EOF
@@ -45,6 +107,9 @@ PrivateKey = $private
 Address = 10.77.10.$number/32, fd77:77:10::$number/128
 DNS = 10.77.30.2
 MTU = 1380
+EOF
+    [[ -z $block ]] || printf '%s\n' "$block" >> "$file"
+    cat >> "$file" <<EOF
 
 [Peer]
 PublicKey = $public
@@ -167,7 +232,7 @@ EOF
 )
 
 cne_render_services() {
-    local root=$1 role=$2 after=network-online.target
+    local root=$1 role=$2 mode=${3:-wireguard} after=network-online.target
     [[ $role != exit ]] || after='network-online.target docker.service'
     cat > "$root/etc/systemd/system/cn-egress.service" <<EOF
 [Unit]
@@ -215,6 +280,30 @@ EOF
     fi
     printf '\n[Install]\nWantedBy=multi-user.target\n' >> "$root/etc/systemd/system/cn-egress-obfs.service"
     printf '[Unit]\nWants=cn-egress-obfs.service\nAfter=cn-egress-obfs.service\n' > "$root/etc/systemd/system/cn-egress.service.d/obfs.conf"
+    if [[ $role == hk && $mode == awg2 ]]; then
+        cat > "$root/etc/systemd/system/cn-egress-users.service" <<'EOF'
+[Unit]
+Description=CN Egress AmneziaWG 2.0 first hop
+Wants=network-online.target
+After=network-online.target
+Before=cn-egress.service
+PartOf=cn-egress.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/cn-egress-users start
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        printf '[Unit]\nRequires=cn-egress-users.service\nBindsTo=cn-egress-users.service\nAfter=cn-egress-users.service\n' > "$root/etc/systemd/system/cn-egress.service.d/users.conf"
+    fi
     if [[ $role == exit ]]; then
         cat > "$root/etc/systemd/system/cn-egress-dns.service" <<'EOF'
 [Unit]
@@ -235,30 +324,34 @@ ProtectSystem=full
 WantedBy=multi-user.target
 EOF
     fi
-    chmod 644 "$root/etc/systemd/system/"*.service "$root/etc/systemd/system/cn-egress.service.d/obfs.conf"
+    chmod 644 "$root/etc/systemd/system/"*.service "$root/etc/systemd/system/cn-egress.service.d/"*.conf
 }
 
 # Run the renderer in a fresh Bash process so a caller's `if`/`!` cannot disable
 # errexit halfway through certificate generation. No source file is unpacked.
-# OUT HK_IP SH_IP USER_PORT WSS_PORT WAN
+# OUT HK_IP SH_IP USER_PORT WSS_PORT WAN [USER_TRANSPORT]
 cne_render_bundle() {
     local definitions
     definitions=$(declare -f cne_render_error cne_render_host cne_render_port \
-        cne_render_key cne_render_client cne_render_interface cne_render_peer \
+        cne_render_key cne_render_awg_params cne_render_awg_generate \
+        cne_render_client cne_render_interface cne_render_peer \
         cne_render_relay_firewall cne_render_exit_firewall cne_render_pki \
         cne_render_services cne_render_bundle_impl cne_net_source \
         cne_obfs_source cne_restrictions_source cne_node_source) || return 1
+    if declare -F cne_users_source >/dev/null; then definitions+=$'\n'"$(declare -f cne_users_source)"; fi
+    if declare -F cne_probe_source >/dev/null; then definitions+=$'\n'"$(declare -f cne_probe_source)"; fi
     printf '%s\ncne_render_bundle_impl "$@"\n' "$definitions" | bash -euo pipefail -s -- "$@"
 }
 
 cne_render_bundle_impl() (
     set -euo pipefail
     umask 077
-    local out=$1 hk=$2 sh=$3 user_port=$4 wss_port=$5 wan=$6
+    local out=$1 hk=$2 sh=$3 user_port=$4 wss_port=$5 wan=$6 mode=${7:-awg2}
     local role root key private public psk name number pair
     cne_render_host "$hk" && cne_render_host "$sh" || { cne_render_error '节点地址无效'; exit 1; }
     cne_render_port "$user_port" && cne_render_port "$wss_port" || { cne_render_error '监听端口无效'; exit 1; }
     [[ $wan =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || { cne_render_error '出口网卡名无效'; exit 1; }
+    [[ $mode == awg2 || $mode == wireguard ]] || { cne_render_error '入口协议无效'; exit 1; }
     [[ ! -e $out && ! -L $out ]] || { cne_render_error '目标目录已存在，请使用新的临时目录'; exit 1; }
     command -v wg >/dev/null && command -v openssl >/dev/null || { cne_render_error '缺少 wg 或 openssl'; exit 1; }
     mkdir -m 700 "$out"
@@ -287,19 +380,40 @@ cne_render_bundle_impl() (
         cp "$out/pki/$role.key" "$root/etc/cn-egress-wss/node.key"
         cp "$out/pki/$role.crt" "$root/etc/cn-egress-wss/node.crt"
         chmod 640 "$root/etc/cn-egress-wss/"{role,sh-host,port,ca.crt,node.key,node.crt}
-        cne_render_services "$root" "$role"
+        cne_render_services "$root" "$role" "$mode"
     done
+    printf '%s\n' "$mode" > "$out/hk/etc/cn-egress/user-transport"
+    if declare -F cne_probe_source >/dev/null; then
+        cne_probe_source > "$out/hk/usr/local/sbin/cn-egress-probe"
+        chmod 755 "$out/hk/usr/local/sbin/cn-egress-probe"
+    fi
+    if [[ $mode == awg2 ]]; then
+        cne_render_awg_generate > "$out/hk/etc/cn-egress/awg-params"
+        cne_render_awg_params "$out/hk/etc/cn-egress/awg-params" >/dev/null
+        # Standalone release embeds this source. Direct renderer tests may
+        # provide it explicitly, just like the existing net/obfs assets.
+        if declare -F cne_users_source >/dev/null; then
+            cne_users_source > "$out/hk/usr/local/sbin/cn-egress-users"
+        else
+            cne_render_error '缺少 AmneziaWG 入口服务脚本'; exit 1
+        fi
+        chmod 755 "$out/hk/usr/local/sbin/cn-egress-users"
+    fi
     cne_render_interface "$(cat "$out/keys/hk_users.key")" '10.77.10.1/24, fd77:77:10::1/64' "$user_port" > "$out/hk/etc/wireguard/cne-users.conf"
+    if [[ $mode == awg2 ]]; then cat "$out/hk/etc/cn-egress/awg-params" >> "$out/hk/etc/wireguard/cne-users.conf"; fi
     cp "$out/keys/hk_users.pub" "$out/hk/etc/cn-egress/server-public"
     : > "$out/client-registry.tsv"
     for pair in iPhone:10 Android:20 Windows:30; do
         name=${pair%:*}; number=${pair#*:}
         private=$(wg genkey); public=$(printf '%s\n' "$private" | wg pubkey); psk=$(wg genpsk)
-        cne_render_client "$out/clients/$name.conf" "$number" "$private" "$(cat "$out/keys/hk_users.pub")" "$psk" "$hk" "$user_port"
+        cne_render_client "$out/clients/$name.conf" "$number" "$private" "$(cat "$out/keys/hk_users.pub")" "$psk" "$hk" "$user_port" "$mode" "$out/hk/etc/cn-egress/awg-params"
         cne_render_peer "$public" "$psk" "10.77.10.$number/32, fd77:77:10::$number/128" >> "$out/hk/etc/wireguard/cne-users.conf"
         printf '%s\t%s\t%s\n' "$name" "$number" "$public" >> "$out/client-registry.tsv"
     done
     cp "$out/client-registry.tsv" "$out/hk/etc/cn-egress/clients.tsv"
+    private=$(wg genkey); public=$(printf '%s\n' "$private" | wg pubkey); psk=$(wg genpsk)
+    cne_render_client "$out/hk/etc/cn-egress/probe.conf" 250 "$private" "$(cat "$out/keys/hk_users.pub")" "$psk" '127.0.0.1' "$user_port" "$mode" "$out/hk/etc/cn-egress/awg-params"
+    cne_render_peer "$public" "$psk" '10.77.10.250/32, fd77:77:10::250/128' >> "$out/hk/etc/wireguard/cne-users.conf"
     cne_render_interface "$(cat "$out/keys/hk_cn.key")" '10.77.20.1/30, fd77:77:20::1/64' > "$out/hk/etc/wireguard/cne-cn.conf"
     cne_render_peer "$(cat "$out/keys/sh_cn.pub")" "$(cat "$out/keys/hk_sh.psk")" '0.0.0.0/0, ::/0' '127.0.0.1:51831' >> "$out/hk/etc/wireguard/cne-cn.conf"
     cne_render_interface "$(cat "$out/keys/sh_cn.key")" '10.77.20.2/30, fd77:77:20::2/64' 51821 > "$out/sh/etc/wireguard/cne-cn.conf"

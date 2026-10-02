@@ -40,6 +40,41 @@ relay_wg_up() {
     net sysctl -q -w "net.ipv4.conf.$interface.rp_filter=2"
 }
 
+relay_users_up() {
+    local mode=wireguard attempt ready=0
+    [[ ! -f "$config_dir/user-transport" ]] || IFS= read -r mode < "$config_dir/user-transport"
+    case $mode in
+        wireguard) relay_wg_up cne-users 10.77.10.1/24 fd77:77:10::1/64; return;;
+        awg2) ;;
+        *) printf '入口协议无效，已停止。\n' >&2; return 1;;
+    esac
+    if ! ip -n "$relay_ns" link show cne-users >/dev/null 2>&1; then
+        # The separate foreground daemon stays in the host namespace. Both
+        # startup and later UDP rebinds therefore use the host's normal route.
+        # A pathname Unix UAPI socket is accessible across network namespaces.
+        for attempt in $(seq 1 100); do
+            if [[ -S /var/run/amneziawg/cne-users.sock ]] && \
+                ip link show cne-users >/dev/null 2>&1 && \
+                /opt/cn-egress/awg-0.2.16/awg show cne-users >/dev/null 2>&1; then
+                ready=1; break
+            fi
+            sleep 0.1
+        done
+        [[ $ready == 1 ]] || { printf 'AmneziaWG 用户态入口未就绪，已停止。\n' >&2; return 1; }
+        relay_pending+=(cne-users)
+        wg-quick strip /etc/wireguard/cne-users.conf | /opt/cn-egress/awg-0.2.16/awg setconf cne-users /dev/stdin
+        # The daemon observes MTU changes in its host namespace. Configure MTU
+        # before moving the TUN; its polling listener handles Up across netns.
+        ip link set cne-users mtu 1380
+        ip link set cne-users netns "$relay_ns"
+        relay_pending=()
+        net ip address add 10.77.10.1/24 dev cne-users
+        net ip -6 address add fd77:77:10::1/64 dev cne-users
+        net ip link set cne-users up
+    fi
+    net sysctl -q -w net.ipv4.conf.cne-users.rp_filter=2
+}
+
 relay_down() {
     local interface
     for interface in "${relay_pending[@]}"; do
@@ -144,7 +179,7 @@ start_hk() {
     # Install the leak prevention rules before allowing VPN forwarding.
     load_firewall
     relay_wg_up cne-cn 10.77.20.1/30 fd77:77:20::1/64
-    relay_wg_up cne-users 10.77.10.1/24 fd77:77:10::1/64
+    relay_users_up
     policy_up cne-users cne-cn 20770
 }
 
