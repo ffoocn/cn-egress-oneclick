@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.3.0
+CNE_VERSION=2.3.1
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -24,9 +24,13 @@ CNE_TRANSACTION_BACKUPS=('' '' '')
 cne_error() { printf '\n错误：%s\n' "$*" >&2; return 1; }
 cne_note() { printf '%s\n' "$*" >&2; }
 cne_line() { printf '%s\n' '----------------------------------------'; }
-cne_ui_interactive() { [[ -t 0 && -t 1 && -t 2 ]]; }
+cne_ui_interactive() { [[ -t 0 && -t 1 ]]; }
 cne_ui_clear() {
-    if cne_ui_interactive && [[ ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
+    # Clear the display and saved lines; web consoles can leave TERM unset.
+    if cne_ui_interactive; then printf '\033[H\033[2J\033[3J'; fi
+}
+cne_prompt_print() {
+    if cne_ui_interactive; then printf "$@"; else printf "$@" >&2; fi
 }
 cne_ui_header() {
     cne_ui_clear
@@ -38,8 +42,8 @@ cne_ui_pause() {
     local answer
     [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
     cne_ui_interactive || return 0
-    printf '\n按回车返回…' >&2
-    IFS= read -r answer || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
+    cne_prompt_print '\n按回车返回…'
+    IFS= read -r answer || { CNE_INPUT_ENDED=1; cne_prompt_print '\n'; return 1; }
 }
 cne_ui_action() {
     local title=$1 failure=$2 CNE_UI_PAGE=$1
@@ -70,15 +74,15 @@ cne_key() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 cne_prompt() {
     local label=$1 default=${2:-} answer
     [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
-    if [[ -n $default ]]; then printf '%s [%s]：' "$label" "$default" >&2; else printf '%s：' "$label" >&2; fi
-    IFS= read -r answer || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
+    if [[ -n $default ]]; then cne_prompt_print '%s [%s]：' "$label" "$default"; else cne_prompt_print '%s：' "$label"; fi
+    IFS= read -r answer || { CNE_INPUT_ENDED=1; cne_prompt_print '\n'; return 1; }
     CNE_ANSWER=${answer:-$default}
 }
 cne_secret() {
     [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
-    printf '%s：' "$1" >&2
-    IFS= read -r -s CNE_ANSWER || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
-    printf '\n' >&2
+    cne_prompt_print '%s：' "$1"
+    IFS= read -r -s CNE_ANSWER || { CNE_INPUT_ENDED=1; cne_prompt_print '\n'; return 1; }
+    cne_prompt_print '\n'
 }
 cne_setup_prompt() {
     cne_prompt "$@" || return 1
