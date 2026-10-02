@@ -124,7 +124,7 @@ cne_backup_validate() {
 }
 cne_backup_create() {
     local idx role id directory path info after exported size
-    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config || return 1
+    cne_mutation_guard && cne_require_config && cne_bootstrap maintenance || return 1
     cne_safe_directory "$CNE_STATE/backups" || return 1
     for idx in 0 1 2; do cne_authenticate "$idx" || return 1; done
     id=$(cne_backup_id) || return 1
@@ -232,7 +232,7 @@ cne_backup_publish() {
 cne_backup_restore() {
     local source idx role host user port identity connection extra id directory current path original before refreshed
     local infos=() targets=() targets_paths=()
-    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config || return 1
+    cne_mutation_guard && cne_require_config && cne_bootstrap maintenance || return 1
     cne_backup_pick || return 1; source=$CNE_BACKUP_SELECTION
     [[ -n $source ]] || { printf '已取消。\n'; return 0; }
     cne_backup_validate "$source" && cne_backup_restorable "$source" || { cne_error '备份校验失败或缺少完整服务，未更改服务。'; return 1; }

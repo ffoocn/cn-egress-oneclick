@@ -23,7 +23,7 @@ cne_renew_state_same() {
 cne_renew_certificates() {
     local automatic=${1:-manual} idx role id directory snapshot path extra before info ca payload stage
     local infos=()
-    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config && cne_renew_collect || return 1
+    cne_mutation_guard && cne_require_config && cne_bootstrap maintenance && cne_renew_collect || return 1
     infos=("${CNE_RENEW_INFOS[@]}")
     if [[ $automatic != automatic ]]; then
         printf '\n将更新三台节点的传输证书，连接会短暂中断。手机和电脑的设备配置保持不变。\n更新前会保存完整备份，失败会恢复原状态。\n'
@@ -87,7 +87,7 @@ cne_renew_publish() {
 cne_renew_auto() {
     local idx due=0 field value
     CNE_NONINTERACTIVE=1
-    cne_bootstrap maintenance && cne_require_config || return 1
+    cne_require_config && cne_bootstrap maintenance || return 1
     cne_transaction_recover || return 1
     cne_renew_collect || return 1
     for idx in 0 1 2; do
@@ -281,7 +281,7 @@ cne_renew_timer_call() {
 }
 cne_renew_timer_enable() {
     local directory script=${BASH_SOURCE[0]}
-    cne_mutation_guard && cne_bootstrap maintenance && cne_require_config && cne_renew_timer_id || return 1
+    cne_mutation_guard && cne_require_config && cne_bootstrap maintenance && cne_renew_timer_id || return 1
     [[ ! -L $CNE_STATE/auto-renew && ( ! -e $CNE_STATE/auto-renew || -f $CNE_STATE/auto-renew && -O $CNE_STATE/auto-renew ) ]] || { cne_error '自动维护记录不安全，未更改定时任务。'; return 1; }
     [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { cne_error '自动维护需要运行 systemd 的 Linux 管理机；其他系统可以使用手动续期。'; return 1; }
     # The source module cannot be installed as a standalone scheduled command.

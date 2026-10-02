@@ -73,7 +73,7 @@ cne_download_verified() {
     cne_note "下载${label}…"
     if ! curl -fL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$temporary"; then
         rm -f "$temporary"
-        cne_error "${label}下载失败：$url。请在菜单 18 设置下载来源，或在菜单 19 导入已校验缓存后重试。"
+        cne_error "${label}下载失败：${url}。请在菜单 18 设置下载来源，或在菜单 19 导入已校验缓存后重试。"
         return 1
     fi
     actual=$(sha256sum "$temporary" | awk '{print $1}') || { rm -f "$temporary"; return 1; }
@@ -182,7 +182,7 @@ cne_download_modules_publish() {
 
 cne_download_bundle_tools() {
     local tool
-    for tool in tar gzip sha256sum find wc head awk sort uniq; do command -v "$tool" >/dev/null 2>&1 || { cne_error "缓存管理缺少 $tool；请先在可联网环境准备依赖。"; return 1; }; done
+    for tool in tar gzip sha256sum find wc head awk sort uniq; do command -v "$tool" >/dev/null 2>&1 || { cne_error "缓存管理缺少 ${tool}；请先在可联网环境准备依赖。"; return 1; }; done
     cne_safe_directory "$CNE_STATE/cache"
 }
 
@@ -228,7 +228,7 @@ cne_download_cache_publish() {
     previous=$(mktemp -d "$CNE_STATE/.cache-before-import.XXXXXXXX") && rmdir "$previous" || { rm -rf "$replacement"; return 1; }
     mv "$cache" "$previous" || { rm -rf "$replacement"; return 1; }
     if ! mv "$replacement" "$cache"; then
-        if ! mv "$previous" "$cache"; then cne_error "缓存发布和恢复均未完成，原缓存保留在 $previous。"; fi
+        if ! mv "$previous" "$cache"; then cne_error "缓存发布和恢复均未完成，原缓存保留在 ${previous}。"; fi
         rm -rf "$replacement"; return 1
     fi
     chmod -R u+w "$previous" && rm -rf "$previous" || cne_note "缓存已导入，但旧临时目录尚未清理：$previous"

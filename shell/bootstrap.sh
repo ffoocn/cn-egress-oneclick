@@ -80,7 +80,7 @@ cne_bootstrap() {
         cne_error '依赖安装失败，请检查上方软件包错误。'; return 1;
     }
     for tool in "${tools[@]}"; do
-        command -v "$tool" >/dev/null 2>&1 || { cne_error "安装后仍缺少 $tool。"; return 1; }
+        command -v "$tool" >/dev/null 2>&1 || { cne_error "安装后仍缺少 ${tool}。"; return 1; }
     done
     printf '依赖准备完成。\n'
 }
