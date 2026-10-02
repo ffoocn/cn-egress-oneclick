@@ -69,10 +69,11 @@ systemctl() {
         *) printf '%s\n' "$*" >> "$work/services.log";;
     esac
 }
-mkdir -p "$node/etc/cn-egress" "$node/etc/sysctl.d" "$node/etc/systemd/system"
+mkdir -p "$node/etc/cn-egress" "$node/etc/cn-egress-wss" "$node/etc/sysctl.d" "$node/etc/systemd/system"
 printf '0123456789abcdef0123456789abcdef\n' > "$node/etc/machine-id"
 printf 'hk\n' > "$node/etc/cn-egress/role"
 printf 'deployment-before\n' > "$node/etc/cn-egress/deployment-id"
+printf '50001 50002 50003 50004 50005\n' > "$node/etc/cn-egress-wss/internal-ports"
 printf 'operator sysctl content\n' > "$node/etc/sysctl.d/90-cn-egress.conf"
 printf 'explicit forwarding retained\n' > "$node/etc/sysctl.d/90-cn-egress-forwarding.conf"
 printf '0\n' > "$node/etc/cn-egress/forwarding-before"
@@ -85,6 +86,7 @@ cp "$node/etc/systemd/system/cn-egress.service" "$work/unit-before"
 ! cne_n_payload_allowed hk etc/sysctl.d/90-cn-egress.conf || fail legacy-payload
 archive=$(cne_n_backup) || fail backup
 [[ -f $archive ]] || fail no-backup
+[[ $(tar -xOzf "$archive" etc/cn-egress-wss/internal-ports) == '50001 50002 50003 50004 50005' ]] || fail internal-port-backup
 ! tar -tzf "$archive" | grep -Fxq etc/sysctl.d/90-cn-egress.conf || fail operator-backed-up
 ! tar -tvzf "$archive" | grep -qv '^-' || fail nonregular-backup
 cne_n_remove_files || fail remove
@@ -92,6 +94,7 @@ cmp -s "$node/etc/sysctl.d/90-cn-egress.conf" "$work/operator-before" || fail op
 [[ -f $node/etc/sysctl.d/90-cn-egress-forwarding.conf && -f $node/etc/cn-egress/forwarding-before && -f $node/etc/cn-egress/forwarding-settings ]] || fail forwarding-removed
 [[ ! -f $node/etc/cn-egress/deployment-id ]] || fail owned-not-removed
 cne_n_restore "$archive" >/dev/null 2>&1 || fail restore
+[[ $(cat "$node/etc/cn-egress-wss/internal-ports") == '50001 50002 50003 50004 50005' ]] || fail internal-port-restore
 cmp -s "$node/etc/sysctl.d/90-cn-egress.conf" "$work/operator-before" || fail operator-restored-over
 cmp -s "$node/etc/systemd/system/cn-egress.service" "$work/unit-before" || fail unit-not-restored
 [[ $(cat "$node/etc/cn-egress/deployment-id") == deployment-before ]] || fail id-not-restored

@@ -10,8 +10,8 @@ setup() {
     source "$ROOT/shell/controller.sh"
     CNE_STATE=$WORK/$1; CNE_TEMP=$CNE_STATE/session
     mkdir -p "$CNE_TEMP" "$CNE_STATE/history"
-    CNE_HOSTS=(203.0.113.10 198.51.100.20 192.0.2.30)
-    printf 'hk\t203.0.113.10\troot\t22\t-\tssh\nsh\t198.51.100.20\troot\t22\t-\tssh\nexit\t192.0.2.30\troot\t22\t-\tssh\n' > "$CNE_STATE/nodes.tsv"
+    CNE_HOSTS=(8.8.8.10 9.9.9.20 10.200.10.2)
+    printf 'hk\t8.8.8.10\troot\t22\t-\tssh\nsh\t9.9.9.20\troot\t22\t-\tssh\nexit\t10.200.10.2\troot\t22\t-\tssh\n' > "$CNE_STATE/nodes.tsv"
     printf '51820 443\n' > "$CNE_STATE/ports"
     cp "$CNE_STATE/nodes.tsv" "$CNE_STATE/nodes.before"
     cp "$CNE_STATE/ports" "$CNE_STATE/ports.before"
@@ -30,20 +30,20 @@ setup() {
 test_node_change() (
     local choice=$1 history
     setup "change-$choice"
-    ANSWERS=(1 203.0.113.11 root 22 - 1 198.51.100.20 root 22 - 1 192.0.2.30 root 22 - 51821 8443 "$choice")
+    ANSWERS=(2 1 8.8.8.11 root 22 - 1 9.9.9.20 root 22 - 1 10.200.10.2 root 22 - 51821 8443 "$choice")
     ANSWER_INDEX=0
     cne_prompt() { CNE_ANSWER=${ANSWERS[$ANSWER_INDEX]}; ANSWER_INDEX=$((ANSWER_INDEX+1)); }
     cne_setup > "$CNE_STATE/output" 2>&1 || fail 'node-change workflow failed'
     grep -Fq '保存设置不会迁移或停止旧服务器服务' "$CNE_STATE/output" || fail 'change did not explain what happens to old services'
     [[ ! -s $TRACE ]] || fail 'editing addresses changed a service'
     if [[ $choice == y ]]; then
-        [[ ${CNE_HOSTS[0]} == 203.0.113.11 && $CNE_USER_PORT == 51821 && $CNE_WSS_PORT == 8443 ]] || fail 'confirmed changes were not saved'
+        [[ ${CNE_HOSTS[0]} == 8.8.8.11 && $CNE_USER_PORT == 51821 && $CNE_WSS_PORT == 8443 ]] || fail 'confirmed changes were not saved'
         history=$(find "$CNE_STATE/history" -maxdepth 1 -type d -name 'node-settings.*')
         [[ -n $history ]] || fail 'old node settings were not retained'
         cmp "$CNE_STATE/nodes.before" "$history/nodes.tsv" || fail 'previous addresses were lost'
         cmp "$CNE_STATE/ports.before" "$history/ports" || fail 'previous ports were lost'
     else
-        [[ ${CNE_HOSTS[0]} == 203.0.113.10 && $CNE_USER_PORT == 51820 && $CNE_WSS_PORT == 443 ]] || fail 'declined changes changed runtime settings'
+        [[ ${CNE_HOSTS[0]} == 8.8.8.10 && $CNE_USER_PORT == 51820 && $CNE_WSS_PORT == 443 ]] || fail 'declined changes changed runtime settings'
         cmp "$CNE_STATE/nodes.before" "$CNE_STATE/nodes.tsv" || fail 'declined changes changed saved addresses'
         cmp "$CNE_STATE/ports.before" "$CNE_STATE/ports" || fail 'declined changes changed saved ports'
         [[ -z $(find "$CNE_STATE/history" -mindepth 1 -print -quit) ]] || fail 'declined changes created history'
@@ -55,7 +55,7 @@ test_service_outcome() (
     setup "$action-$failure"
     DOCTOR_FAIL=0; SERVICE_FAIL=0
     case $failure in doctor) DOCTOR_FAIL=1; expected=1;; service) SERVICE_FAIL=1; expected=1;; esac
-    if cne_action_all "$action" > "$CNE_STATE/output" 2>&1; then
+    if cne_action_all "$action" <<<'y' > "$CNE_STATE/output" 2>&1; then
         [[ $expected == 0 ]] || fail 'failed lifecycle reported usable connection'
     else [[ $expected == 1 ]] || fail 'healthy lifecycle failed'; fi
     count=$(grep -c ' doctor$' "$TRACE" || true)

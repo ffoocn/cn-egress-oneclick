@@ -75,6 +75,8 @@ mock_setup() {
             if [[ $MOCK_PREFLIGHT_ROUND == 0 || -f $CNE_STATE/prepared ]]; then return 72; fi
         fi
         case $action in
+            plan-ports)
+                case $idx in 0) printf 'hk_local=51831\n';; 1) printf 'sh_hk=51821\nsh_exit=51822\n';; 2) printf 'exit_local=51832\ndns=5354\n';; esac ;;
             inspect) printf 'state=%s\nrole=%s\nwan=eth0\narch=x86_64\nforwarding=%s\n' "${MOCK_STATES[$idx]}" "${CNE_ROLES[$idx]}" "$MOCK_FORWARDING" ;;
             backup)
                 cp "$CNE_STATE/mock-nodes/$idx" "$CNE_STATE/mock-backups/${CNE_ROLES[$idx]}"
@@ -90,7 +92,7 @@ mock_setup() {
     }
     cne_render_bundle() {
         local out=$1 role name
-        [[ $# == 7 && $7 == awg2 ]] || fail 'renderer did not select AWG2'
+        [[ $# == 12 && $7 == awg2 && ${12} == 5354 ]] || fail 'renderer did not select AWG2 with the planned internal ports'
         printf 'render\n' >> "$MOCK_TRACE"
         mkdir -p "$out/clients"
         for role in hk sh exit; do
@@ -181,7 +183,7 @@ test_fresh() (
     mock_setup fresh
     cne_install > "$CNE_STATE/output" 2>&1 || fail 'fresh installation failed'
     assert_absent "$MOCK_TRACE" '^choice$|^rpc [012] restore '
-    assert_count "$MOCK_TRACE" '^rpc [012] preflight fresh 51820 443$' 6
+    assert_count "$MOCK_TRACE" '^rpc [012] preflight fresh 51820 443 51831 51821 51822 51832 5354$' 6
     assert_count "$MOCK_TRACE" '^rpc [012] prepare awg2$' 3
     assert_count "$MOCK_TRACE" '^awg x86_64$' 1
     [[ $(grep '^install ' "$MOCK_TRACE") == $'install 1 fresh\ninstall 2 fresh\ninstall 0 fresh' ]] || fail 'fresh installation order or mode'

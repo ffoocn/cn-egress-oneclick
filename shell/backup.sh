@@ -108,7 +108,7 @@ cne_backup_validate() {
     done <<< "$canonical"
     [[ ${roles[0]} != "${roles[1]}" && ${roles[0]} != "${roles[2]}" && ${roles[1]} != "${roles[2]}" ]] || return 1
     IFS=' ' read -r user_port wss_port extra < "$directory/ports" || return 1
-    cne_port "$user_port" && cne_port "$wss_port" && [[ -z $extra && $user_port != 51831 && $(wc -l < "$directory/ports") -eq 1 ]] || return 1
+    cne_port "$user_port" && cne_port "$wss_port" && [[ -z $extra && $(wc -l < "$directory/ports") -eq 1 ]] || return 1
     idx=0
     while IFS=$'\t' read -r role path extra; do
         ((idx<3)) && [[ $role == "${CNE_ROLES[$idx]}" && -z $extra && $path =~ ^/root/cn-egress-backups/[A-Za-z0-9][A-Za-z0-9._-]{0,159}\.tar\.gz$ ]] || return 1

@@ -255,7 +255,7 @@ test_invalid_configuration_repair() (
     cp "$CNE_STATE/ports" "$WORK/repair-$choice.ports.before"
     cne_initialize > "$OUTPUT" 2>&1 || fail 'malformed configuration blocked initialization for repair'
     [[ $CNE_CONFIG_INVALID == 1 ]] || fail 'repair fixture was not flagged invalid'
-    ANSWERS=(1 203.0.113.10 root 22 - 1 198.51.100.20 root 22 - 1 192.0.2.30 root 22 - 51820 443 "$choice")
+    ANSWERS=(2 1 8.8.8.10 root 22 - 1 9.9.9.20 root 22 - 1 10.200.10.2 root 22 - 51820 443 "$choice")
     ANSWER_INDEX=0
     cne_prompt() {
         [[ $ANSWER_INDEX -lt ${#ANSWERS[@]} ]] || fail 'repair requested unexpected additional input'

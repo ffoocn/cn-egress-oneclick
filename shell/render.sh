@@ -155,12 +155,14 @@ EOF
 }
 
 cne_render_exit_firewall() {
+    local dns=${2:-5354}
+    cne_render_port "$dns" || return 1
     cat <<EOF
 table inet cn_egress {
   chain input_guard {
     type filter hook input priority -5; policy accept;
-    iifname "cne-exit" ip saddr 10.77.10.0/24 udp dport 5354 counter accept
-    iifname "cne-exit" ip saddr 10.77.10.0/24 tcp dport 5354 counter accept
+    iifname "cne-exit" ip saddr 10.77.10.0/24 udp dport $dns counter accept
+    iifname "cne-exit" ip saddr 10.77.10.0/24 tcp dport $dns counter accept
     iifname "cne-exit" meta l4proto { icmp, ipv6-icmp } accept
     iifname "cne-exit" counter drop
   }
@@ -180,8 +182,8 @@ table inet cn_egress {
   }
   chain dns_redirect {
     type nat hook prerouting priority dstnat - 5; policy accept;
-    iifname "cne-exit" ip saddr 10.77.10.0/24 ip daddr 10.77.30.2 udp dport 53 counter redirect to :5354
-    iifname "cne-exit" ip saddr 10.77.10.0/24 ip daddr 10.77.30.2 tcp dport 53 counter redirect to :5354
+    iifname "cne-exit" ip saddr 10.77.10.0/24 ip daddr 10.77.30.2 udp dport 53 counter redirect to :$dns
+    iifname "cne-exit" ip saddr 10.77.10.0/24 ip daddr 10.77.30.2 tcp dport 53 counter redirect to :$dns
   }
 }
 EOF
@@ -347,9 +349,14 @@ cne_render_bundle_impl() (
     set -euo pipefail
     umask 077
     local out=$1 hk=$2 sh=$3 user_port=$4 wss_port=$5 wan=$6 mode=${7:-awg2}
-    local role root key private public psk name number pair
+    local hk_local=${8:-51831} sh_hk=${9:-51821} sh_exit=${10:-51822} exit_local=${11:-51832} dns=${12:-5354}
+    local role root key private public psk name number pair internal
     cne_render_host "$hk" && cne_render_host "$sh" || { cne_render_error '节点地址无效'; exit 1; }
     cne_render_port "$user_port" && cne_render_port "$wss_port" || { cne_render_error '监听端口无效'; exit 1; }
+    for internal in "$hk_local" "$sh_hk" "$sh_exit" "$exit_local" "$dns"; do
+        [[ $internal =~ ^[1-9][0-9]{0,4}$ ]] && cne_render_port "$internal" || { cne_render_error '内部端口无效'; exit 1; }
+    done
+    [[ $user_port != "$hk_local" && $sh_hk != "$sh_exit" && $exit_local != "$dns" ]] || { cne_render_error '同一节点内部端口重复'; exit 1; }
     [[ $wan =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || { cne_render_error '出口网卡名无效'; exit 1; }
     [[ $mode == awg2 || $mode == wireguard ]] || { cne_render_error '入口协议无效'; exit 1; }
     [[ ! -e $out && ! -L $out ]] || { cne_render_error '目标目录已存在，请使用新的临时目录'; exit 1; }
@@ -376,10 +383,11 @@ cne_render_bundle_impl() (
         printf '%s\n' "$role" > "$root/etc/cn-egress-wss/role"
         printf '%s\n' "$sh" > "$root/etc/cn-egress-wss/sh-host"
         printf '%s\n' "$wss_port" > "$root/etc/cn-egress-wss/port"
+        printf '%s %s %s %s %s\n' "$hk_local" "$sh_hk" "$sh_exit" "$exit_local" "$dns" > "$root/etc/cn-egress-wss/internal-ports"
         cp "$out/pki/ca.crt" "$root/etc/cn-egress-wss/ca.crt"
         cp "$out/pki/$role.key" "$root/etc/cn-egress-wss/node.key"
         cp "$out/pki/$role.crt" "$root/etc/cn-egress-wss/node.crt"
-        chmod 640 "$root/etc/cn-egress-wss/"{role,sh-host,port,ca.crt,node.key,node.crt}
+        chmod 640 "$root/etc/cn-egress-wss/"{role,sh-host,port,internal-ports,ca.crt,node.key,node.crt}
         cne_render_services "$root" "$role" "$mode"
     done
     printf '%s\n' "$mode" > "$out/hk/etc/cn-egress/user-transport"
@@ -415,32 +423,32 @@ cne_render_bundle_impl() (
     cne_render_client "$out/hk/etc/cn-egress/probe.conf" 250 "$private" "$(cat "$out/keys/hk_users.pub")" "$psk" '127.0.0.1' "$user_port" "$mode" "$out/hk/etc/cn-egress/awg-params"
     cne_render_peer "$public" "$psk" '10.77.10.250/32, fd77:77:10::250/128' >> "$out/hk/etc/wireguard/cne-users.conf"
     cne_render_interface "$(cat "$out/keys/hk_cn.key")" '10.77.20.1/30, fd77:77:20::1/64' > "$out/hk/etc/wireguard/cne-cn.conf"
-    cne_render_peer "$(cat "$out/keys/sh_cn.pub")" "$(cat "$out/keys/hk_sh.psk")" '0.0.0.0/0, ::/0' '127.0.0.1:51831' >> "$out/hk/etc/wireguard/cne-cn.conf"
-    cne_render_interface "$(cat "$out/keys/sh_cn.key")" '10.77.20.2/30, fd77:77:20::2/64' 51821 > "$out/sh/etc/wireguard/cne-cn.conf"
+    cne_render_peer "$(cat "$out/keys/sh_cn.pub")" "$(cat "$out/keys/hk_sh.psk")" '0.0.0.0/0, ::/0' "127.0.0.1:$hk_local" >> "$out/hk/etc/wireguard/cne-cn.conf"
+    cne_render_interface "$(cat "$out/keys/sh_cn.key")" '10.77.20.2/30, fd77:77:20::2/64' "$sh_hk" > "$out/sh/etc/wireguard/cne-cn.conf"
     cne_render_peer "$(cat "$out/keys/hk_cn.pub")" "$(cat "$out/keys/hk_sh.psk")" '10.77.20.1/32, fd77:77:20::1/128, 10.77.10.0/24, fd77:77:10::/64' >> "$out/sh/etc/wireguard/cne-cn.conf"
-    cne_render_interface "$(cat "$out/keys/sh_exit.key")" '10.77.30.1/30, fd77:77:30::1/64' 51822 > "$out/sh/etc/wireguard/cne-exit.conf"
+    cne_render_interface "$(cat "$out/keys/sh_exit.key")" '10.77.30.1/30, fd77:77:30::1/64' "$sh_exit" > "$out/sh/etc/wireguard/cne-exit.conf"
     cne_render_peer "$(cat "$out/keys/exit.pub")" "$(cat "$out/keys/sh_exit.psk")" '0.0.0.0/0, ::/0' >> "$out/sh/etc/wireguard/cne-exit.conf"
     cne_render_interface "$(cat "$out/keys/exit.key")" '10.77.30.2/30, fd77:77:30::2/64' > "$out/exit/etc/wireguard/cne-exit.conf"
-    cne_render_peer "$(cat "$out/keys/sh_exit.pub")" "$(cat "$out/keys/sh_exit.psk")" '10.77.30.1/32, fd77:77:30::1/128, 10.77.10.0/24, fd77:77:10::/64' '127.0.0.1:51832' >> "$out/exit/etc/wireguard/cne-exit.conf"
+    cne_render_peer "$(cat "$out/keys/sh_exit.pub")" "$(cat "$out/keys/sh_exit.psk")" '10.77.30.1/32, fd77:77:30::1/128, 10.77.10.0/24, fd77:77:10::/64' "127.0.0.1:$exit_local" >> "$out/exit/etc/wireguard/cne-exit.conf"
     cne_render_relay_firewall cne-users cne-cn > "$out/hk/etc/cn-egress/firewall.nft"
     cne_render_relay_firewall cne-cn cne-exit > "$out/sh/etc/cn-egress/firewall.nft"
-    cne_render_exit_firewall "$wan" > "$out/exit/etc/cn-egress/firewall.nft"
+    cne_render_exit_firewall "$wan" "$dns" > "$out/exit/etc/cn-egress/firewall.nft"
     printf '%s\n' "$wan" > "$out/exit/etc/cn-egress/wan-interface"
-    cne_restrictions_source > "$out/sh/etc/cn-egress-wss/restrictions.yaml"
+    cne_restrictions_source | sed -e "s/\"51821\"/\"$sh_hk\"/g" -e "s/\"51822\"/\"$sh_exit\"/g" > "$out/sh/etc/cn-egress-wss/restrictions.yaml"
     chmod 640 "$out/sh/etc/cn-egress-wss/restrictions.yaml"
-    cat > "$out/sh/etc/cn-egress-wss/guard.nft" <<'EOF'
+    cat > "$out/sh/etc/cn-egress-wss/guard.nft" <<EOF
 table inet cne_wss_input {
   chain input_guard {
     type filter hook input priority -10; policy accept;
-    iifname != "lo" udp dport { 51821, 51822 } counter drop
+    iifname != "lo" udp dport { $sh_hk, $sh_exit } counter drop
   }
 }
 EOF
-    cat > "$out/exit/etc/cn-egress/dnsmasq.conf" <<'EOF'
+    cat > "$out/exit/etc/cn-egress/dnsmasq.conf" <<EOF
 interface=cne-exit
 listen-address=10.77.30.2
 bind-dynamic
-port=5354
+port=$dns
 cache-size=1000
 domain-needed
 bogus-priv

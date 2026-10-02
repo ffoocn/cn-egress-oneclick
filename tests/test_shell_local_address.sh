@@ -21,18 +21,20 @@ check_role() (
     sudo() { fail 'setup requested privilege'; }
     cne_prompt() {
         case $1 in
+            *设置方式*) CNE_ANSWER=1;;
             *连接方式*) if [[ $idx == "$role" ]]; then CNE_ANSWER=2; else CNE_ANSWER=1; fi;;
             *IPv4*)
                 printf '%s\t%s\n' "$idx" "${2:-}" >> "$ADDRESS_TRACE"
                 if [[ $idx == "$role" ]]; then CNE_ANSWER=${2:-8.8.4.4}
-                elif [[ $idx == 0 ]]; then CNE_ANSWER=203.0.113.10
-                elif [[ $idx == 1 ]]; then CNE_ANSWER=198.51.100.20
-                else CNE_ANSWER=192.0.2.30; fi;;
+                elif [[ $idx == 0 ]]; then CNE_ANSWER=8.8.8.10
+                elif [[ $idx == 1 ]]; then CNE_ANSWER=9.9.9.20
+                else CNE_ANSWER=10.200.10.2; fi;;
             *SSH*用户*) [[ $idx != "$role" ]] || fail 'local node requested SSH user'; CNE_ANSWER=root;;
             *SSH*端口*) [[ $idx != "$role" ]] || fail 'local node requested SSH port'; CNE_ANSWER=22;;
             *SSH*私钥*) [[ $idx != "$role" ]] || fail 'local node requested SSH key'; CNE_ANSWER=-;;
             *客户端*端口*) CNE_ANSWER=51820;;
             *TLS*端口*) CNE_ANSWER=443;;
+            *确认保存*) CNE_ANSWER=y;;
             *) fail "unexpected setup prompt: $1";;
         esac
     }

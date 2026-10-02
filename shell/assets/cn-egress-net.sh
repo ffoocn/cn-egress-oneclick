@@ -185,10 +185,12 @@ start_hk() {
 
 start_sh() {
     relay_init
-    obfs_guard_up
     load_firewall
     relay_wg_up cne-cn 10.77.20.2/30 fd77:77:20::2/64
     relay_wg_up cne-exit 10.77.30.1/30 fd77:77:30::1/64
+    # Bind both planned listeners before restricting host ports. A late business
+    # listener conflict must fail without briefly filtering that service.
+    obfs_guard_up
     net ip route replace 10.77.10.0/24 dev cne-cn
     net ip -6 route replace fd77:77:10::/64 dev cne-cn
     policy_up cne-cn cne-exit 20771

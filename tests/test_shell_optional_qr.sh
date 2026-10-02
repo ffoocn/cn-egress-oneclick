@@ -134,7 +134,9 @@ test_management() (
 1
 3
 4
+y
 5
+y
 0
 0' > "$CNE_STATE/output" 2>&1 || fail 'optional QR blocked the management menu'
     local action idx

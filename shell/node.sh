@@ -41,6 +41,7 @@ etc/cn-egress-wss/node.key
 etc/cn-egress-wss/ca.crt
 etc/cn-egress-wss/sh-host
 etc/cn-egress-wss/port
+etc/cn-egress-wss/internal-ports
 etc/cn-egress-wss/restrictions.yaml
 etc/cn-egress-wss/guard.nft
 etc/wireguard/cne-users.conf
@@ -68,7 +69,7 @@ FILES
 cne_n_payload_allowed() {
     local role=$1 path=$2
     case "$path" in
-        etc/cn-egress/role|etc/cn-egress/version|etc/cn-egress/deployment-id|etc/cn-egress/firewall.nft|etc/cn-egress-wss/role|etc/cn-egress-wss/node.crt|etc/cn-egress-wss/node.key|etc/cn-egress-wss/ca.crt|etc/cn-egress-wss/sh-host|etc/cn-egress-wss/port|etc/systemd/system/cn-egress.service|etc/systemd/system/cn-egress-obfs.service|etc/systemd/system/cn-egress.service.d/obfs.conf|usr/local/sbin/cn-egress|usr/local/sbin/cn-egress-node|usr/local/sbin/cn-egress-net|usr/local/sbin/cn-egress-obfs|opt/cn-egress/wstunnel-11.0.0/wstunnel) return 0;;
+        etc/cn-egress/role|etc/cn-egress/version|etc/cn-egress/deployment-id|etc/cn-egress/firewall.nft|etc/cn-egress-wss/role|etc/cn-egress-wss/node.crt|etc/cn-egress-wss/node.key|etc/cn-egress-wss/ca.crt|etc/cn-egress-wss/sh-host|etc/cn-egress-wss/port|etc/cn-egress-wss/internal-ports|etc/systemd/system/cn-egress.service|etc/systemd/system/cn-egress-obfs.service|etc/systemd/system/cn-egress.service.d/obfs.conf|usr/local/sbin/cn-egress|usr/local/sbin/cn-egress-node|usr/local/sbin/cn-egress-net|usr/local/sbin/cn-egress-obfs|opt/cn-egress/wstunnel-11.0.0/wstunnel) return 0;;
         etc/wireguard/cne-users.conf|etc/cn-egress/clients.tsv|etc/cn-egress/server-public) [[ $role == hk ]];;
         etc/cn-egress/user-transport|etc/cn-egress/awg-params|etc/cn-egress/probe.conf|etc/systemd/system/cn-egress-users.service|etc/systemd/system/cn-egress.service.d/users.conf|usr/local/sbin/cn-egress-probe|usr/local/sbin/cn-egress-users|opt/cn-egress/awg-0.2.16/amneziawg-go|opt/cn-egress/awg-0.2.16/amneziawg-tools.tar.gz) [[ $role == hk ]];;
         etc/wireguard/cne-cn.conf) [[ $role == hk || $role == sh ]];;
@@ -290,7 +291,14 @@ cne_n_scope_check() {
     fi
 }
 cne_n_port_owned() {
-    local role=$1 proto=$2 port=$3 line=$4 iface unit pid group
+    local role=$1 proto=$2 port=$3 line=$4 iface unit pid group pids
+    pids=$(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2) || :
+    if [[ -n $pids ]]; then
+        while IFS= read -r pid; do
+            [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cgroup ]] && grep -Eq '(^|/)cn-egress-(obfs|dns|users)\.service($|/)' "/proc/$pid/cgroup" || return 1
+        done <<< "$pids"
+        return 0
+    fi
     if [[ $proto == udp ]] && cne_n_has wg; then
         for iface in cne-users cne-cn cne-exit; do
             if [[ $iface == cne-users && $(cne_n_user_transport) == awg2 ]]; then
@@ -301,23 +309,91 @@ cne_n_port_owned() {
             fi
         done
     fi
-    while IFS= read -r pid; do
-        [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cgroup ]] || continue
-        if grep -Eq '(^|/)cn-egress-(obfs|dns|users)\.service($|/)' "/proc/$pid/cgroup"; then return 0; fi
-    done < <(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2)
     return 1
 }
+cne_n_internal_port() {
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1<=65535 ))
+}
+cne_n_internal_values() {
+    (($#==5)) || return 1
+    local value
+    for value in "$@"; do cne_n_internal_port "$value" || return 1; done
+    [[ $2 != "$3" && $4 != "$5" ]] || return 1
+    printf '%s %s %s %s %s\n' "$@"
+}
+cne_n_internal_ports() {
+    local file=${1:-/etc/cn-egress-wss/internal-ports} values
+    cne_n_safe_path "$file" || return 1
+    if [[ ! -e $file ]]; then printf '51831 51821 51822 51832 5354\n'; return 0; fi
+    [[ $(awk 'END{print NR}' "$file") == 1 ]] || { cne_n_error '内部端口设置必须只有一行。'; return 1; }
+    values=$(cat "$file") || return 1
+    [[ $values =~ ^([1-9][0-9]{0,4})\ ([1-9][0-9]{0,4})\ ([1-9][0-9]{0,4})\ ([1-9][0-9]{0,4})\ ([1-9][0-9]{0,4})$ ]] || { cne_n_error '内部端口设置格式无效。'; return 1; }
+    cne_n_internal_values "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" || { cne_n_error '内部端口设置无效。'; return 1; }
+}
+cne_n_port_available() {
+    local role=$1 mode=$2 protocols=$3 candidate=$4 listeners=$5 excluded=${6:-} line proto address
+    [[ " $excluded " != *" $candidate "* ]] || return 1
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        proto=${line%% *}; proto=${proto%6}
+        [[ " $protocols " == *" $proto "* ]] || continue
+        address=$(awk '{print $5}' <<< "$line")
+        [[ ${address##*:} == "$candidate" ]] || continue
+        if [[ $mode != fresh ]] && cne_n_port_owned "$role" "$proto" "$candidate" "$line"; then continue; fi
+        return 1
+    done <<< "$listeners"
+}
+cne_n_port_choose() {
+    local role=$1 mode=$2 protocols=$3 preferred=$4 listeners=$5 excluded=${6:-} candidate
+    if cne_n_port_available "$role" "$mode" "$protocols" "$preferred" "$listeners" "$excluded"; then printf '%s\n' "$preferred"; return 0; fi
+    for ((candidate=49152;candidate<=65535;candidate++)); do
+        if cne_n_port_available "$role" "$mode" "$protocols" "$candidate" "$listeners" "$excluded"; then printf '%s\n' "$candidate"; return 0; fi
+    done
+    cne_n_error '没有可用的内部端口；未停止或更改现有服务。'
+}
+cne_n_plan_ports() {
+    local role=$1 mode=${2:-fresh} users=${3:-51820} wss=${4:-443} listeners='' existing values=() selected first second
+    cne_n_role_ok "$role" && [[ $mode == fresh || $mode == replace || $mode == manage ]] && cne_n_internal_port "$users" && cne_n_internal_port "$wss" || { cne_n_error '端口规划参数无效。'; return 1; }
+    existing='51831 51821 51822 51832 5354'
+    if [[ $mode != fresh ]]; then
+        if selected=$(cne_n_internal_ports); then existing=$selected; else printf '旧内部端口设置无效，重新规划时使用默认候选。\n' >&2; fi
+    fi
+    read -r -a values <<< "$existing"
+    if cne_n_has ss; then
+        listeners=$(ss -H -lntup 2>/dev/null) || { cne_n_error '无法读取端口占用，未继续安装。'; return 1; }
+    else
+        printf '暂缺 ss，内部端口占用将在准备依赖后重新检查。\n' >&2
+    fi
+    case $role in
+        hk) selected=$(cne_n_port_choose "$role" "$mode" udp "${values[0]}" "$listeners" "$users") || return 1; printf 'hk_local=%s\n' "$selected";;
+        sh)
+            first=$(cne_n_port_choose "$role" "$mode" udp "${values[1]}" "$listeners") || return 1
+            second=$(cne_n_port_choose "$role" "$mode" udp "${values[2]}" "$listeners" "$first") || return 1
+            printf 'sh_hk=%s\nsh_exit=%s\n' "$first" "$second";;
+        exit)
+            first=$(cne_n_port_choose "$role" "$mode" udp "${values[3]}" "$listeners") || return 1
+            second=$(cne_n_port_choose "$role" "$mode" 'udp tcp' "${values[4]}" "$listeners" "$first") || return 1
+            printf 'exit_local=%s\ndns=%s\n' "$first" "$second";;
+    esac
+}
 cne_n_ports_check() {
-    local role=$1 mode=$2 users=$3 wss=$4 proto port line local_address rest needed=''
+    local role=$1 mode=$2 users=$3 wss=$4 hk_local=${5:-51831} sh_hk=${6:-51821} sh_exit=${7:-51822} exit_local=${8:-51832} dns=${9:-5354}
+    local proto port line local_address needed='' listeners
+    cne_n_internal_values "$hk_local" "$sh_hk" "$sh_exit" "$exit_local" "$dns" >/dev/null && [[ $role != hk || $users != "$hk_local" ]] || { cne_n_error '内部端口规划无效。'; return 1; }
     cne_n_has ss || return 0
-    case $role in hk) needed="udp:$users udp:51831";; sh) needed="tcp:$wss udp:51821 udp:51822";; exit) needed='udp:51832 udp:5354 tcp:5354';; esac
+    case $role in hk) needed="udp:$users udp:$hk_local";; sh) needed="tcp:$wss udp:$sh_hk udp:$sh_exit";; exit) needed="udp:$exit_local udp:$dns tcp:$dns";; esac
+    listeners=$(ss -H -lntup 2>/dev/null) || { cne_n_error '无法读取端口占用，未继续安装。'; return 1; }
     while IFS= read -r line; do
         proto=${line%% *}; proto=${proto%6}
         local_address=$(awk '{print $5}' <<< "$line"); port=${local_address##*:}
         case " $needed " in *" $proto:$port "*) :;; *) continue;; esac
         if [[ $mode != fresh ]] && cne_n_port_owned "$role" "$proto" "$port" "$line"; then continue; fi
-        cne_n_error "端口 $proto/$port 已被其他服务占用；请调整安装端口。"; return 1
-    done < <(ss -H -lntup 2>/dev/null)
+        case $role:$proto:$port in
+            hk:udp:"$users"|sh:tcp:"$wss") cne_n_error "对外端口 $proto/$port 已被其他服务占用；请在“修改节点”选择其他对外端口。";;
+            *) cne_n_error "内部端口 $proto/$port 在规划后被其他服务占用；请重新执行一键安装，脚本会重新避让。";;
+        esac
+        return 1
+    done <<< "$listeners"
 }
 cne_n_routes_check() {
     local mode=$1
@@ -335,13 +411,13 @@ cne_n_routes_check() {
     if ! ip -6 route show table all | awk -v mode="$mode" '{owned=0;for(i=1;i<NF;i++)if($i=="dev" && $(i+1)~/^cne-(users|cn|exit)$/)owned=1;if(mode!="fresh"&&owned)next;if($0~/fd77:0*77:(0*10|0*20|0*30):/)bad=1}END{exit bad?1:0}'; then cne_n_error '现有 IPv6 路由与 VPN 网段重叠。'; return 1; fi
 }
 cne_n_preflight() {
-    local role=$1 mode=${2:-fresh} users=${3:-51820} wss=${4:-443}
+    local role=$1 mode=${2:-fresh} users=${3:-51820} wss=${4:-443} hk_local=${5:-51831} sh_hk=${6:-51821} sh_exit=${7:-51822} exit_local=${8:-51832} dns=${9:-5354}
     cne_n_os_check || return 1
     [[ $mode == fresh || $mode == replace || $mode == manage ]] || { cne_n_error '安装模式无效。'; return 1; }
-    [[ $users =~ ^[0-9]+$ && $wss =~ ^[0-9]+$ ]] && (( users>=1 && users<=65535 && wss>=1 && wss<=65535 && users!=51831 )) || { cne_n_error '端口无效。'; return 1; }
+    cne_n_internal_port "$users" && cne_n_internal_port "$wss" && cne_n_internal_values "$hk_local" "$sh_hk" "$sh_exit" "$exit_local" "$dns" >/dev/null && [[ $role != hk || $users != "$hk_local" ]] || { cne_n_error '端口无效。'; return 1; }
     if [[ $mode == fresh ]] && cne_n_exists; then cne_n_error '检测到已有文件；请选择保留管理或备份后覆盖安装。'; return 1; fi
     cne_n_scope_check || return 1
-    cne_n_ports_check "$role" "$mode" "$users" "$wss" || return 1
+    cne_n_ports_check "$role" "$mode" "$users" "$wss" "$hk_local" "$sh_hk" "$sh_exit" "$exit_local" "$dns" || return 1
     cne_n_routes_check "$mode" || return 1
     printf '检查通过\n'
 }
@@ -359,7 +435,8 @@ cne_n_install_plan_safe() {
     done <<< "$1"
 }
 cne_n_prepare() {
-    local role=$1 transport=${2:-wireguard} tool package audit plan ca_missing=0
+    local role=$1 transport=${2:-wireguard} tool package audit plan ca_missing=0 label
+    case $role in hk) label=香港入口;; sh) label=大陆中转;; exit) label=国内出口;; *) cne_n_error '节点角色无效。'; return 1;; esac
     [[ $transport == wireguard || $transport == awg2 ]] || { cne_n_error '客户端传输类型无效。'; return 1; }
     cne_n_os_check || return 1
     local -a packages=()
@@ -379,15 +456,19 @@ cne_n_prepare() {
             case " ${packages[*]-} " in *" $package "*) :;; *) packages+=("$package");; esac
         fi
     done
-    ((${#packages[@]})) || { printf '依赖已齐全\n'; return 0; }
-    cne_n_has apt-get && cne_n_has dpkg || { cne_n_error '未找到 apt-get/dpkg。'; return 1; }
-    audit=$(LC_ALL=C dpkg --audit 2>&1) || { cne_n_error '现有软件包状态未完成，请先处理 dpkg。'; return 1; }
-    [[ -z $audit ]] || { cne_n_error '现有软件包状态未完成，请先处理 dpkg。'; return 1; }
-    printf '安装缺少的依赖：%s\n' "${packages[*]}" >&2
-    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get update </dev/null >&2 || return 1
-    plan=$(LC_ALL=C apt-get -s --no-remove --no-upgrade --no-install-recommends install "${packages[@]}" 2>&1) || { cne_n_error '无法生成依赖安装方案。'; return 1; }
-    cne_n_install_plan_safe "$plan" || { cne_n_error '依赖安装会升级、删除或配置已有软件，已停止。'; return 1; }
-    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove --no-upgrade --no-install-recommends install "${packages[@]}" </dev/null >&2 || return 1
+    ((${#packages[@]})) || { printf '%s：依赖已齐全\n' "$label"; return 0; }
+    cne_n_has apt-get && cne_n_has dpkg || { cne_n_error "${label}：未找到 apt-get/dpkg，请使用 Debian 或 Ubuntu 节点。"; return 1; }
+    if ! audit=$(LC_ALL=C dpkg --audit 2>&1) || [[ -n $audit ]]; then
+        cne_n_error "${label}：现有软件包状态未完成，依赖安装已停止；未替换 VPN 服务。" || :
+        [[ -z $audit ]] || printf '%s\n' "$audit" >&2
+        printf '请在%s这台服务器执行只读检查：sudo dpkg --audit\n把上方结果交给该服务器的维护人员处理，完成后回到主菜单选择“一键安装”重试。已填写的节点仍保留。\n' "$label" >&2
+        return 1
+    fi
+    printf '%s：安装缺少的依赖 %s\n' "$label" "${packages[*]}" >&2
+    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get update </dev/null >&2 || { cne_n_error "${label}：软件源更新失败。请检查这台服务器的网络和 APT 软件源；处理后重新选择“一键安装”，节点设置已保留。"; return 1; }
+    plan=$(LC_ALL=C apt-get -s --no-remove --no-upgrade --no-install-recommends install "${packages[@]}" 2>&1) || { cne_n_error "${label}：无法生成依赖安装方案，未替换 VPN 服务。" || :; [[ -z $plan ]] || printf '%s\n' "$plan" >&2; return 1; }
+    cne_n_install_plan_safe "$plan" || { cne_n_error "${label}：依赖安装会升级、删除或配置已有软件，已停止，未替换 VPN 服务。" || :; printf '%s\n请让这台服务器的维护人员检查上述软件包计划，然后重新选择“一键安装”。\n' "$plan" >&2; return 1; }
+    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove --no-upgrade --no-install-recommends install "${packages[@]}" </dev/null >&2 || { cne_n_error "${label}：依赖安装失败。请保留上方软件包错误，处理这台服务器的软件包状态后重试“一键安装”。"; return 1; }
     for package in $pairs; do cne_n_has "${package%%:*}" || { cne_n_error "依赖安装后仍找不到 ${package%%:*}。"; return 1; }; done
     if ((ca_missing)); then
         [[ $(dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null) == 'install ok installed' && -s /etc/ssl/certs/ca-certificates.crt ]] || { cne_n_error 'CA 证书依赖安装后仍不可用。'; return 1; }
@@ -527,10 +608,12 @@ cne_n_validate_backup_contents() {
     if [[ -f $destination/etc/cn-egress/deployment-id ]]; then
         [[ $(cat "$destination/etc/cn-egress/deployment-id") =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '备份部署编号无效。'; return 1; }
     fi
+    if [[ -f $destination/etc/cn-egress-wss/internal-ports ]]; then cne_n_internal_ports "$destination/etc/cn-egress-wss/internal-ports" >/dev/null || return 1; fi
 }
 cne_n_restore_apply() {
     local temporary=$1 override_id=${2:-} file unit state enabled failures=0 marker
     [[ -z $override_id || $override_id =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '恢复操作编号无效。'; return 1; }
+    cne_n_restore_ports_check "$temporary" || return 1
     cne_n_stop_owned || return 1
     for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
         [[ ! -f /etc/systemd/system/$unit ]] || systemctl disable "$unit" >&2 || failures=1
@@ -749,6 +832,7 @@ cne_n_restore_target_check() (
         wan=$(cne_n_wan) || exit 1
         [[ -n $wan && $(cat "$stage/etc/cn-egress/wan-interface") == "$wan" ]] || { cne_n_error '出口上联网卡已改变，不能直接恢复该备份。'; exit 1; }
     fi
+    cne_n_internal_stage_check "$role" "$stage" && cne_n_restore_ports_check "$stage" || exit 1
 )
 cne_n_restore_import() {
     local role=$1 upload=$2 basename=$3 expected=$4 operation=$5 stage archive incoming
@@ -838,6 +922,62 @@ cne_n_certificate_apply() {
     [[ $(systemctl is-enabled cn-egress-obfs.service 2>/dev/null || :) == "$enabled" ]] || { cne_n_error '传输服务启用状态已改变，更新未完成。'; return 1; }
     printf '传输证书已更新，设备配置保持不变。\n'
 }
+cne_n_restore_ports_check() {
+    local stage=$1 role values ports=() users=51820 wss
+    [[ -f $stage/etc/cn-egress-wss/internal-ports ]] || return 0
+    # Rollback may deliberately restore a partial pre-install snapshot. Preserve
+    # that state rather than treating it as a complete historical deployment.
+    [[ -f $stage/etc/cn-egress/role && -f $stage/etc/cn-egress-wss/port ]] || return 0
+    role=$(cat "$stage/etc/cn-egress/role") || return 1
+    cne_n_role_ok "$role" || return 0
+    case $role in
+        hk) [[ -f $stage/etc/wireguard/cne-users.conf && -f $stage/etc/wireguard/cne-cn.conf ]] || return 0;;
+        sh) [[ -f $stage/etc/wireguard/cne-cn.conf && -f $stage/etc/wireguard/cne-exit.conf && -f $stage/etc/cn-egress-wss/guard.nft && -f $stage/etc/cn-egress-wss/restrictions.yaml ]] || return 0;;
+        exit) [[ -f $stage/etc/wireguard/cne-exit.conf && -f $stage/etc/cn-egress/dnsmasq.conf && -f $stage/etc/cn-egress/firewall.nft ]] || return 0;;
+    esac
+    cne_n_internal_stage_check "$role" "$stage" || return 1
+    if [[ -f $stage/.cn-egress-services.tsv ]] && ! awk -F'\t' '$2=="active"{found=1}END{exit !found}' "$stage/.cn-egress-services.tsv"; then return 0; fi
+    cne_n_has ss || { cne_n_error '缺少 ss，无法确认历史端口是否被其他服务占用；请先准备依赖。'; return 1; }
+    values=$(cne_n_internal_ports "$stage/etc/cn-egress-wss/internal-ports") || return 1
+    read -r -a ports <<< "$values"
+    wss=$(cat "$stage/etc/cn-egress-wss/port") || return 1
+    if [[ $role == hk ]]; then users=$(sed -nE 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/cne-users.conf"); fi
+    cne_n_internal_port "$users" && cne_n_internal_port "$wss" || { cne_n_error '历史备份监听端口无效。'; return 1; }
+    cne_n_ports_check "$role" replace "$users" "$wss" "${ports[@]}" || { cne_n_error '历史备份端口当前不可用；未停止或更改现有服务。'; return 1; }
+}
+cne_n_internal_stage_check() {
+    local role=$1 stage=$2 manifest=$2/etc/cn-egress-wss/internal-ports values ports=() actual expected file
+    [[ -e $manifest || -L $manifest ]] || return 0
+    values=$(cne_n_internal_ports "$manifest") || return 1
+    read -r -a ports <<< "$values"
+    case $role in
+        hk)
+            actual=$(sed -nE 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/cne-cn.conf")
+            [[ $actual == "127.0.0.1:${ports[0]}" ]] || { cne_n_error '香港内部传输端口与规划不一致。'; return 1; }
+            actual=$(sed -nE 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/cne-users.conf")
+            cne_n_internal_port "$actual" && [[ $actual != "${ports[0]}" ]] || { cne_n_error '香港入口端口与内部传输冲突。'; return 1; }
+            ;;
+        sh)
+            for file in cne-cn:1 cne-exit:2; do
+                actual=$(sed -nE 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/${file%:*}.conf")
+                [[ $actual == "${ports[${file#*:}]}" ]] || { cne_n_error '大陆中转 WireGuard 端口与规划不一致。'; return 1; }
+            done
+            expected=${ports[1]}$'\n'${ports[2]}
+            actual=$(sed -nE 's/^[[:space:]]*port:[[:space:]]*\["([0-9]+)"\][[:space:]]*$/\1/p' "$stage/etc/cn-egress-wss/restrictions.yaml")
+            [[ $actual == "$expected" ]] && grep -Fq "iifname != \"lo\" udp dport { ${ports[1]}, ${ports[2]} } counter drop" "$stage/etc/cn-egress-wss/guard.nft" || { cne_n_error '大陆中转传输限制与内部端口规划不一致。'; return 1; }
+            ;;
+        exit)
+            actual=$(sed -nE 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/cne-exit.conf")
+            [[ $actual == "127.0.0.1:${ports[3]}" ]] || { cne_n_error '出口内部传输端口与规划不一致。'; return 1; }
+            actual=$(sed -nE 's/^port=([0-9]+)$/\1/p' "$stage/etc/cn-egress/dnsmasq.conf")
+            [[ $actual == "${ports[4]}" ]] || { cne_n_error '出口 DNS 端口与规划不一致。'; return 1; }
+            for file in udp tcp; do
+                grep -Fq "iifname \"cne-exit\" ip saddr 10.77.10.0/24 $file dport ${ports[4]} counter accept" "$stage/etc/cn-egress/firewall.nft" && grep -Fq "iifname \"cne-exit\" ip saddr 10.77.10.0/24 ip daddr 10.77.30.2 $file dport 53 counter redirect to :${ports[4]}" "$stage/etc/cn-egress/firewall.nft" || { cne_n_error '出口 DNS 转发规则与规划不一致。'; return 1; }
+            done
+            ;;
+        *) return 1;;
+    esac
+}
 cne_n_validate_archive() {
     local role=$1 archive=$2 destination=$3 list verbose path number
     [[ -f $archive && ! -L $archive ]] || { cne_n_error '安装包不存在或不是普通文件。'; return 1; }
@@ -855,7 +995,7 @@ cne_n_validate_archive() {
     verbose=$(tar -tvzf "$archive") || return 1
     if grep -qv '^-' <<< "$verbose"; then cne_n_error '安装包仅允许普通文件，不能含目录、链接或设备。'; return 1; fi
     tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$destination" || return 1
-    local expected actual interface local_port required='etc/cn-egress/firewall.nft etc/cn-egress-wss/role etc/cn-egress-wss/node.crt etc/cn-egress-wss/node.key etc/cn-egress-wss/ca.crt etc/cn-egress-wss/port etc/systemd/system/cn-egress.service etc/systemd/system/cn-egress-obfs.service usr/local/sbin/cn-egress-net usr/local/sbin/cn-egress-obfs opt/cn-egress/wstunnel-11.0.0/wstunnel'
+    local expected actual interface local_port internal_values internal=() required='etc/cn-egress/firewall.nft etc/cn-egress-wss/role etc/cn-egress-wss/node.crt etc/cn-egress-wss/node.key etc/cn-egress-wss/ca.crt etc/cn-egress-wss/port etc/systemd/system/cn-egress.service etc/systemd/system/cn-egress-obfs.service usr/local/sbin/cn-egress-net usr/local/sbin/cn-egress-obfs opt/cn-egress/wstunnel-11.0.0/wstunnel'
     case $role in hk) required="$required etc/wireguard/cne-users.conf etc/wireguard/cne-cn.conf";; sh) required="$required etc/wireguard/cne-cn.conf etc/wireguard/cne-exit.conf etc/cn-egress-wss/guard.nft etc/cn-egress-wss/restrictions.yaml";; exit) required="$required etc/wireguard/cne-exit.conf etc/cn-egress/wan-interface etc/cn-egress/dnsmasq.conf etc/systemd/system/cn-egress-dns.service";; esac
     if [[ $role == hk && -f $destination/etc/cn-egress/user-transport ]]; then
         actual=$(cat "$destination/etc/cn-egress/user-transport")
@@ -871,11 +1011,14 @@ cne_n_validate_archive() {
         [[ $(grep -Eic '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$path") == 1 ]] || { cne_n_error 'WireGuard 必须使用 Table = off。'; return 1; }
         if grep -Eiq '^[[:space:]]*(PreUp|PostUp|PreDown|PostDown|SaveConfig|DNS)[[:space:]]*=' "$path"; then cne_n_error 'WireGuard 配置不能含路由脚本或系统 DNS 修改。'; return 1; fi
     done
-    case $role in hk) interface=cne-cn; local_port=51831;; exit) interface=cne-exit; local_port=51832;; *) interface='';; esac
+    internal_values=$(cne_n_internal_ports "$destination/etc/cn-egress-wss/internal-ports") || return 1
+    read -r -a internal <<< "$internal_values"
+    case $role in hk) interface=cne-cn; local_port=${internal[0]};; exit) interface=cne-exit; local_port=${internal[3]};; *) interface='';; esac
     if [[ -n $interface ]]; then
         actual=$(sed -nE 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$destination/etc/wireguard/$interface.conf")
         [[ $actual == "127.0.0.1:$local_port" ]] || { cne_n_error '节点隧道必须使用本机加密传输端点。'; return 1; }
     fi
+    cne_n_internal_stage_check "$role" "$destination" || return 1
     for path in "$destination"/etc/wireguard/*.conf; do
         interface=${path##*/}; interface=${interface%.conf}
         case $role:$interface in
@@ -963,7 +1106,7 @@ cne_n_install_apply() {
     [[ $role != hk || $(cne_n_user_transport) != awg2 ]] || systemctl is-active --quiet cn-egress-users.service || return 1
 }
 cne_n_install() {
-    local role=$1 mode=$2 archive=$3 id=$4 stage backup before after user_port=51820 wss_port
+    local role=$1 mode=$2 archive=$3 id=$4 stage backup before after user_port=51820 wss_port internal_values internal=()
     [[ $mode == fresh || $mode == replace ]] || { cne_n_error '安装模式必须为 fresh 或 replace。'; return 1; }
     [[ $id =~ ^[a-zA-Z0-9_-]{8,80}$ ]] || { cne_n_error '部署编号无效。'; return 1; }
     cne_n_os_check && cne_n_scope_check || return 1
@@ -973,7 +1116,9 @@ cne_n_install() {
     if ! cne_n_compile_tools "$role" "$stage"; then rm -rf "$stage"; return 1; fi
     wss_port=$(cat "$stage/etc/cn-egress-wss/port")
     if [[ $role == hk ]]; then user_port=$(sed -nE 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$stage/etc/wireguard/cne-users.conf"); fi
-    if ! cne_n_preflight "$role" "$mode" "$user_port" "$wss_port" >&2; then rm -rf "$stage"; return 1; fi
+    if ! internal_values=$(cne_n_internal_ports "$stage/etc/cn-egress-wss/internal-ports"); then rm -rf "$stage"; return 1; fi
+    read -r -a internal <<< "$internal_values"
+    if ! cne_n_preflight "$role" "$mode" "$user_port" "$wss_port" "${internal[@]}" >&2; then rm -rf "$stage"; return 1; fi
     backup=$(cne_n_backup) || { rm -rf "$stage"; return 1; }
     before=$(cne_n_route_snapshot "$role") || { rm -rf "$stage"; return 1; }
     trap 'cne_n_rollback "$backup" >&2; rm -rf "$stage"; exit 130' HUP INT TERM
@@ -994,24 +1139,49 @@ cne_n_require_role() {
 }
 cne_n_net() { local role=$1; shift; if [[ $role == hk || $role == sh ]]; then ip netns exec cn-egress-relay "$@"; else "$@"; fi; }
 cne_n_status() {
-    local role=$1 unit state iface stamp now age available=0
+    local role=$1 unit state iface stamp now age available=0 label key data name interfaces='' handshakes
     if ! cne_n_exists; then printf '尚未安装\n'; return 0; fi
-    printf '角色：%s\n' "$(cne_n_existing_role)"
+    case $(cne_n_existing_role) in hk) label='香港入口';; sh) label='大陆中转';; exit) label='国内出口';; *) label='未知，请检查节点设置';; esac
+    printf '节点：%s\n' "$label"
     for unit in cn-egress.service cn-egress-obfs.service cn-egress-dns.service cn-egress-users.service; do
         [[ $unit != cn-egress-dns.service || $role == exit ]] || continue
         [[ $unit != cn-egress-users.service || ( $role == hk && $(cne_n_user_transport) == awg2 ) ]] || continue
         state=$(systemctl is-active "$unit" 2>/dev/null) || :
-        case $unit in cn-egress.service) printf 'VPN：%s\n' "$state";; cn-egress-obfs.service) printf '传输：%s\n' "$state";; cn-egress-users.service) printf '客户端混淆入口：%s\n' "$state";; *) printf 'DNS：%s\n' "$state";; esac
+        case $state in active) state='运行中';; inactive) state='已停止';; failed) state='异常，请查看日志';; activating) state='正在启动';; deactivating) state='正在停止';; *) state='无法确认，请查看日志';; esac
+        case $unit in cn-egress.service) printf '连接服务：%s\n' "$state";; cn-egress-obfs.service) printf '节点传输：%s\n' "$state";; cn-egress-users.service) printf '设备入口：%s\n' "$state";; *) printf '域名查询服务：%s\n' "$state";; esac
     done
     now=$(date +%s)
-    for iface in cne-users cne-cn cne-exit; do
-        while read -r _ stamp; do
+    case $role in hk) interfaces=cne-cn;; sh) interfaces='cne-cn cne-exit';; exit) interfaces=cne-exit;; esac
+    printf '服务器之间的连接：\n'
+    for iface in $interfaces; do
+        case $iface in cne-cn) label='香港 ↔ 大陆中转';; cne-exit) label='大陆中转 ↔ 国内出口';; esac
+        while read -r key stamp; do
             [[ $stamp =~ ^[0-9]+$ ]] || continue
             available=1
-            if ((stamp==0)); then printf '握手 %-10s 尚未建立\n' "$iface"; else age=$((now-stamp)); printf '握手 %-10s %s 秒前\n' "$iface" "$age"; fi
+            if ((stamp==0)); then printf '  %s：尚未连通；请查看连接诊断\n' "$label"
+            elif ((stamp>now)); then printf '  %s：时间异常，请核对系统时间\n' "$label"
+            else
+                age=$((now-stamp))
+                if ((age>180)); then printf '  %s：最近连接 %s 秒前，请查看连接诊断\n' "$label" "$age"
+                else printf '  %s：最近连接 %s 秒前\n' "$label" "$age"; fi
+            fi
         done < <(cne_n_show_handshakes "$role" "$iface" 2>/dev/null)
     done
-    ((available)) || printf '握手：暂无数据\n'
+    ((available)) || printf '  暂无连接数据；已停止时属正常，运行中可查看连接诊断。\n'
+    if [[ $role == hk ]]; then
+        data=$(cne_n_client_list) || data=''
+        handshakes=$(cne_n_show_handshakes "$role" cne-users 2>/dev/null) || handshakes=''
+        printf '设备连接（未打开应用或尚未导入时，未连接属正常）：\n'
+        while IFS=$'\t' read -r name label key; do
+            [[ -n $name && -n $key ]] || continue
+            stamp=$(awk -v k="$key" '$1==k{print $2;exit}' <<< "$handshakes") || stamp=''
+            if [[ ! $stamp =~ ^[0-9]+$ ]] || ((stamp==0)); then printf '  %s：尚未连接\n' "$name"
+            elif ((stamp>now)); then printf '  %s：时间异常，请核对系统时间\n' "$name"
+            else age=$((now-stamp)); printf '  %s：最近连接 %s 秒前\n' "$name" "$age"; fi
+        done <<< "$data"
+        [[ -n $data ]] || printf '  暂无已登记设备。\n'
+    fi
+    return 0
 }
 cne_n_show_handshakes() {
     local role=$1 iface=$2
@@ -1038,12 +1208,14 @@ cne_n_handshake_check() {
     return "$failed"
 }
 cne_n_dns_check() {
-    local response
+    local response values internal=()
     if ! awk '/^[[:space:]]*nameserver[[:space:]]+/{if($2!="0.0.0.0" && $2!="::" && $2~/^[A-Fa-f0-9:.%_-]+$/)found=1}END{exit !found}' /etc/resolv.conf; then
         cne_n_error '出口机没有可用的系统 DNS 上游。'; return 1
     fi
     cne_n_has dig || { cne_n_error '缺少 dig，无法验证出口 DNS；请先准备依赖。'; return 1; }
-    response=$(dig +time=3 +tries=1 +noall +comments +answer @10.77.30.2 -p 5354 api.ipify.org A 2>/dev/null) || { cne_n_error '出口 DNS 查询失败。'; return 1; }
+    values=$(cne_n_internal_ports) || return 1
+    read -r -a internal <<< "$values"
+    response=$(dig +time=3 +tries=1 +noall +comments +answer @10.77.30.2 -p "${internal[4]}" api.ipify.org A 2>/dev/null) || { cne_n_error '出口 DNS 查询失败。'; return 1; }
     if [[ $response != *'status: NOERROR,'* ]] || ! awk '$4=="A" && $5~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{found=1}END{exit !found}' <<< "$response"; then
         cne_n_error '出口 DNS 未返回有效 IPv4 应答。'; return 1
     fi
@@ -1346,6 +1518,7 @@ cne_n_dispatch() {
         inspect) cne_n_inspect;;
         maintenance-info) (($#==0)) || return 2; cne_n_maintenance_info "$role";;
         preflight) cne_n_preflight "$role" "$@";;
+        plan-ports) (($#==3)) || return 2; cne_n_plan_ports "$role" "$@";;
         prepare) cne_n_prepare "$role" "${1:-wireguard}";;
         backup) cne_n_scope_check && cne_n_backup;;
         backup-export) (($#==1)) || return 2; cne_n_backup_export "$role" "$@";;
@@ -1387,7 +1560,7 @@ cne_node_main() (
         cne_n_safe_path /run/lock/cn-egress.lock || return 1
         exec 9>/run/lock/cn-egress.lock || return 1
         flock -w 30 9 || { cne_n_error '另一个安装或管理操作正在运行。'; return 1; }
-    elif [[ $action != inspect && $action != preflight && $action != prepare && $action != status ]]; then cne_n_error '缺少 flock，请先安装依赖。'; return 1; fi
+    elif [[ $action != inspect && $action != preflight && $action != plan-ports && $action != prepare && $action != status ]]; then cne_n_error '缺少 flock，请先安装依赖。'; return 1; fi
     cne_n_dispatch "$@"
 )
 if [[ ${CNE_NODE_LIBRARY:-0} != 1 && ${BASH_SOURCE[0]:-} == "$0" ]]; then cne_node_main "$@"; fi

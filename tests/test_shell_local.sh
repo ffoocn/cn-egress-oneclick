@@ -253,11 +253,13 @@ test_local_failure_reauthentication() (
 test_local_setup() (
     local reserved=${1:-no}
     mock_setup "setup-$reserved"
+    CNE_HOSTS=(8.8.8.10 9.9.9.20 10.200.10.2)
     local connection_questions=0 ssh_questions=0 udp_questions=0
     CNE_CONNECTIONS=(ssh ssh ssh)
     cne_prompt() {
-        printf 'prompt %s %s\n' "$idx" "$1" >> "$MOCK_TRACE"
+        printf 'prompt %s %s\n' "${idx:-wizard}" "$1" >> "$MOCK_TRACE"
         case $1 in
+            *设置方式*) CNE_ANSWER=2 ;;
             *连接方式*)
                 connection_questions=$((connection_questions+1))
                 if [[ $idx == 2 ]]; then CNE_ANSWER=2; else CNE_ANSWER=1; fi ;;
@@ -269,19 +271,19 @@ test_local_setup() (
                 udp_questions=$((udp_questions+1))
                 if [[ $reserved == yes && $udp_questions == 1 ]]; then CNE_ANSWER=51831; else CNE_ANSWER=51820; fi ;;
             *TLS*端口*) CNE_ANSWER=443 ;;
+            *确认保存*) CNE_ANSWER=y ;;
             *) fail "unexpected setup question: $1" ;;
         esac
     }
     cne_setup > "$CNE_STATE/output" 2>&1 || fail 'local setup failed'
     [[ $connection_questions == 3 && $ssh_questions == 6 ]] || fail 'setup asked unexpected connection or SSH questions'
-    assert_line "$CNE_STATE/nodes.tsv" $'exit\t192.0.2.30\tfixture\t22\t-\tlocal'
+    assert_line "$CNE_STATE/nodes.tsv" $'exit\t10.200.10.2\tfixture\t22\t-\tlocal'
     [[ ${CNE_CONNECTIONS[*]} == 'ssh ssh local' ]] || fail 'setup did not retain the local selection'
     [[ ${CNE_USERS[2]} == fixture && ${CNE_PORTS[2]} == 22 && ${CNE_IDENTITIES[2]} == - ]] || fail 'local node inherited obsolete SSH identity settings'
     if [[ $reserved == yes ]]; then
-        [[ $udp_questions == 2 && $CNE_USER_PORT == 51820 ]] || fail 'reserved client port was saved instead of asking for another port'
-        grep -Fq '51831 用于内部隧道' "$CNE_STATE/output" || fail 'reserved client port was not explained'
+        [[ $udp_questions == 1 && $CNE_USER_PORT == 51831 ]] || fail 'internal port planning still imposes a reserved client port'
         assert_absent "$MOCK_TRACE" '^ssh|secret-prompt'
-        printf 'PASS: reserved client port is rejected during setup before SSH authentication\n'
+        printf 'PASS: client port may use the former internal default; internal planning avoids it\n'
     else
         [[ $udp_questions == 1 ]] || fail 'valid client port was unexpectedly asked again'
         printf 'PASS: selecting this machine skips irrelevant SSH questions and saves the local role\n'
@@ -300,10 +302,11 @@ test_setup_cancel() (
     local globals_before globals_after
     globals_before=$(declare -p CNE_HOSTS CNE_USERS CNE_PORTS CNE_IDENTITIES CNE_CONNECTIONS CNE_USER_PORT CNE_WSS_PORT CNE_AUTH_READY CNE_PASSWORDS)
     cne_prompt() {
-        printf 'prompt %s %s\n' "$idx" "$1" >> "$MOCK_TRACE"
+        printf 'prompt %s %s\n' "${idx:-wizard}" "$1" >> "$MOCK_TRACE"
         case $1 in
+            *设置方式*) CNE_ANSWER=2 ;;
             *连接方式*) if [[ $position == early ]]; then CNE_ANSWER=0; elif [[ $idx == 2 ]]; then CNE_ANSWER=2; else CNE_ANSWER=1; fi ;;
-            *IPv4*) CNE_ANSWER=203.0.113.$((idx+100)) ;;
+            *IPv4*) CNE_ANSWER=8.8.8.$((idx+100)) ;;
             *SSH*用户*) CNE_ANSWER=root ;;
             *SSH*端口*) CNE_ANSWER=2222 ;;
             *SSH*私钥*) CNE_ANSWER=- ;;
