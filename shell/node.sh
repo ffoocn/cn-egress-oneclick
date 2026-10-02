@@ -949,7 +949,7 @@ cne_n_install_apply() {
     chmod 755 /opt/cn-egress /opt/cn-egress/wstunnel-11.0.0 || return 1
     [[ ! -d /opt/cn-egress/awg-0.2.16 ]] || chmod 755 /opt/cn-egress/awg-0.2.16 || return 1
     printf '%s\n' "$role" > /etc/cn-egress/role || return 1
-    printf '2.2.1\n' > /etc/cn-egress/version || return 1
+    printf '2.2.2\n' > /etc/cn-egress/version || return 1
     chmod 600 /etc/cn-egress/{role,version,deployment-id} || return 1
     systemctl daemon-reload >&2 || return 1
     cne_n_scope_check || return 1

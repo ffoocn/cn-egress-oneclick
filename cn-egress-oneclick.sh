@@ -955,7 +955,7 @@ cne_n_install_apply() {
     chmod 755 /opt/cn-egress /opt/cn-egress/wstunnel-11.0.0 || return 1
     [[ ! -d /opt/cn-egress/awg-0.2.16 ]] || chmod 755 /opt/cn-egress/awg-0.2.16 || return 1
     printf '%s\n' "$role" > /etc/cn-egress/role || return 1
-    printf '2.2.1\n' > /etc/cn-egress/version || return 1
+    printf '2.2.2\n' > /etc/cn-egress/version || return 1
     chmod 600 /etc/cn-egress/{role,version,deployment-id} || return 1
     systemctl daemon-reload >&2 || return 1
     cne_n_scope_check || return 1
@@ -2848,7 +2848,7 @@ EOF
 )
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.2.1
+CNE_VERSION=2.2.2
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -3009,13 +3009,10 @@ cne_configured() {
     [[ ${CNE_HOSTS[0]} != "${CNE_HOSTS[1]}" && ${CNE_HOSTS[0]} != "${CNE_HOSTS[2]}" && ${CNE_HOSTS[1]} != "${CNE_HOSTS[2]}" ]]
 }
 cne_unconfigured_status() {
-    local idx
-    printf '\n节点状态\n'; cne_line
-    for idx in 0 1 2; do printf '  %s：尚未配置\n' "${CNE_LABELS[$idx]}"; done
-    printf '\n当前管理目录：%s\n' "$CNE_STATE"
-    if [[ ${CNE_CONFIG_INVALID:-0} == 1 ]]; then printf '原节点设置无效，未加载。请选择“2. 修改节点”修复；原文件会先保存。\n'
-    else printf '请选择“1. 一键安装”或“2. 修改节点”填写节点。尚未配置表示当前管理目录没有节点设置。\n'; fi
-    printf '若此前使用其他账号运行，请使用原账号，或用 CNE_HOME 指定原管理目录。\n'
+    printf '\n'
+    if [[ ${CNE_CONFIG_INVALID:-0} == 1 ]]; then printf '节点设置无效。菜单 2 重新填写，原文件会保留。\n'
+    else printf '节点尚未配置。菜单 1 安装 / 2 修改节点。\n'; fi
+    printf '管理目录：%s\n' "$CNE_STATE"
 }
 
 cne_local_ipv4() {
@@ -3902,22 +3899,28 @@ cne_client_remove() {
     cne_client_mark_revoked "$file" || return 1
     printf '客户端已撤销。\n'
 }
+cne_menu_show() {
+    printf '\n'; cne_line
+    printf '  一键安装与管理  v%s\n' "$CNE_VERSION"
+    cne_line
+    printf '\n  1. 一键安装\n  2. 修改节点\n  3. 查看状态\n  4. 连接诊断\n\n'
+    printf '  5. 启动服务\n  6. 停止服务\n  7. 重启服务\n  8. 查看日志\n  9. 备份配置\n\n'
+    printf '  10. 客户端列表\n  11. 添加客户端\n  12. 显示配置与二维码\n  13. 撤销客户端\n\n'
+    printf '  14. 卸载服务\n'
+    [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成操作\n'
+    printf '  16. 恢复历史备份\n  17. 证书续期与自动维护\n  18. 配置下载来源\n  19. 组件离线包\n'
+    printf '  m. 显示菜单\n  0. 退出\n\n'
+}
 cne_menu() {
-    local choice
+    local choice prompt
+    cne_menu_show
     while :; do
-        printf '\n'; cne_line
-        printf '  一键安装与管理  v%s\n' "$CNE_VERSION"
-        cne_line
-        printf '\n  1. 一键安装\n  2. 修改节点\n  3. 查看状态\n  4. 连接诊断\n\n'
-        printf '  5. 启动服务\n  6. 停止服务\n  7. 重启服务\n  8. 查看日志\n  9. 备份配置\n\n'
-        printf '  10. 客户端列表\n  11. 添加客户端\n  12. 显示配置与二维码\n  13. 撤销客户端\n\n'
-        printf '  14. 卸载服务\n'
-        [[ ! -e $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成操作\n'
-        printf '  16. 恢复历史备份\n  17. 证书续期与自动维护\n  18. 配置下载来源\n  19. 组件离线包\n'
-        printf '  0. 退出\n\n'
-        cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
+        prompt='请选择（m 菜单 / 0 退出）'
+        [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || prompt='请选择（15 恢复未完成操作 / m 菜单 / 0 退出）'
+        cne_prompt "$prompt" || return 0; choice=$CNE_ANSWER
         case $choice in
             0) return 0;;
+            m|M) cne_menu_show;;
             1) cne_install || cne_note '操作未完成，具体原因见上方。';;
             2) cne_setup || cne_note '节点设置未完成。';;
             3) cne_status || cne_note '部分节点不可用。';;
@@ -3940,8 +3943,9 @@ cne_menu() {
             17) cne_renew_menu || cne_note '证书维护未完成，具体原因见上方。';;
             18) cne_download_setup || cne_note '下载来源设置未完成。';;
             19) cne_download_bundle_menu || cne_note '组件离线包操作未完成。';;
-            *) cne_note '请输入菜单中的编号。';;
+            *) cne_note '请输入编号，或输入 m 查看菜单。';;
         esac
+        printf '\n'
     done
 }
 cne_main() {

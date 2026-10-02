@@ -68,10 +68,7 @@ test_empty_menu() (
 10
 0' > "$OUTPUT" 2>&1 || fail 'fresh menu did not remain usable after read-only choices'
     contains "$OUTPUT" "$CNE_STATE"
-    contains "$OUTPUT" '香港入口'
-    contains "$OUTPUT" '大陆中转'
-    contains "$OUTPUT" '国内出口'
-    [[ $(grep -c '未配置' "$OUTPUT" || true) -ge 9 ]] || fail 'status, diagnosis and logs did not identify all three unconfigured nodes'
+    [[ $(grep -c '节点尚未配置' "$OUTPUT" || true) -ge 3 ]] || fail 'status, diagnosis and logs did not identify the unconfigured manager'
     absent "$OUTPUT" '配置安装节点|连接方式（|IPv4 地址：|首次准备：|SSH 密码：'
     [[ $(cat "$TRACE") == 'bootstrap ui' ]] || fail 'fresh read-only menu prepared operation dependencies'
     assert_no_configuration_writes
@@ -83,7 +80,7 @@ test_empty_command() (
     setup "empty-$operation"
     cne_main "$operation" > "$OUTPUT" 2>&1 || fail "unconfigured $operation command failed instead of reporting its state"
     contains "$OUTPUT" "$CNE_STATE"
-    [[ $(grep -c '未配置' "$OUTPUT" || true) -ge 3 ]] || fail "$operation did not report all three unconfigured roles"
+    contains "$OUTPUT" '节点尚未配置'
     absent "$OUTPUT" '配置安装节点|连接方式（|IPv4 地址：|首次准备：'
     [[ $(cat "$TRACE") == 'bootstrap ui' ]] || fail "$operation prepared management dependencies"
     assert_no_configuration_writes
