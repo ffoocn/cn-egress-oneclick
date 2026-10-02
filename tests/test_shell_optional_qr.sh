@@ -131,9 +131,11 @@ test_management() (
     MOCK_AUDIT=broken
     MOCK_UID=1000
     cne_main menu <<<'3
+1
+3
+4
 5
-6
-7
+0
 0' > "$CNE_STATE/output" 2>&1 || fail 'optional QR blocked the management menu'
     local action idx
     for action in status start stop restart; do
@@ -148,10 +150,14 @@ test_export_menu() (
     mock_setup export-menu
     MOCK_AUDIT=broken
     MOCK_UID=1000
-    cne_main menu <<<'12
+    cne_main menu <<<'4
+3
 phone
 1
-5
+0
+3
+3
+0
 0' > "$CNE_STATE/output" 2>&1 || fail 'QR fallback ended the management menu'
     assert_fallback
     assert_absent "$MOCK_TRACE" 'apt-get|sudo|^qrencode '

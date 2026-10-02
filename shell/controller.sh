@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bash controller. The release builder embeds all required Shell sources.
-CNE_VERSION=2.2.2
+CNE_VERSION=2.3.0
 CNE_ROLES=(hk sh exit)
 CNE_LABELS=('香港入口' '大陆中转' '国内出口')
 CNE_HOSTS=('' '' '')
@@ -12,6 +12,7 @@ CNE_PASSWORDS=('' '' '')
 CNE_SUDOS=('' '' '')
 CNE_AUTH_READY=(0 0 0)
 CNE_CONFIG_INVALID=0
+CNE_INPUT_ENDED=0
 CNE_USER_PORT=51820
 CNE_WSS_PORT=443
 CNE_TRANSACTION_ACTIVE=0
@@ -23,6 +24,33 @@ CNE_TRANSACTION_BACKUPS=('' '' '')
 cne_error() { printf '\n错误：%s\n' "$*" >&2; return 1; }
 cne_note() { printf '%s\n' "$*" >&2; }
 cne_line() { printf '%s\n' '----------------------------------------'; }
+cne_ui_interactive() { [[ -t 0 && -t 1 && -t 2 ]]; }
+cne_ui_clear() {
+    if cne_ui_interactive && [[ ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
+}
+cne_ui_header() {
+    cne_ui_clear
+    printf '%s  v%s\n' "$1" "$CNE_VERSION"
+    cne_line
+    printf '\n'
+}
+cne_ui_pause() {
+    local answer
+    [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
+    cne_ui_interactive || return 0
+    printf '\n按回车返回…' >&2
+    IFS= read -r answer || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
+}
+cne_ui_action() {
+    local title=$1 failure=$2 CNE_UI_PAGE=$1
+    shift 2
+    cne_ui_header "$title"
+    if ! "$@"; then
+        [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
+        cne_note "$failure"
+    fi
+    cne_ui_pause
+}
 cne_field() { printf '%s\n' "$1" | awk -F= -v key="$2" '$1==key {sub(/^[^=]*=/, "");print;exit}'; }
 cne_nodes_canonical() {
     awk -F'\t' 'NF==5 {print $0 "\tssh";next} NF==6 {print;next} {bad=1} END{exit (bad||NR!=3)?1:0}' "$1"
@@ -41,13 +69,15 @@ cne_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; }
 cne_key() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 cne_prompt() {
     local label=$1 default=${2:-} answer
+    [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
     if [[ -n $default ]]; then printf '%s [%s]：' "$label" "$default" >&2; else printf '%s：' "$label" >&2; fi
-    IFS= read -r answer || return 1
+    IFS= read -r answer || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
     CNE_ANSWER=${answer:-$default}
 }
 cne_secret() {
+    [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
     printf '%s：' "$1" >&2
-    IFS= read -r -s CNE_ANSWER || return 1
+    IFS= read -r -s CNE_ANSWER || { CNE_INPUT_ENDED=1; printf '\n' >&2; return 1; }
     printf '\n' >&2
 }
 cne_setup_prompt() {
@@ -56,7 +86,7 @@ cne_setup_prompt() {
 }
 cne_mutation_guard() {
     [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || {
-        cne_error '存在尚未完成恢复的操作。请先选择“15. 重试恢复”，恢复前可以查看状态、日志和诊断。'
+        cne_error '存在尚未完成恢复的操作。请先选择“维护与设置 → 重试恢复”，恢复前可以查看状态、日志和诊断。'
         return 1
     }
 }
@@ -162,8 +192,8 @@ cne_configured() {
 }
 cne_unconfigured_status() {
     printf '\n'
-    if [[ ${CNE_CONFIG_INVALID:-0} == 1 ]]; then printf '节点设置无效。菜单 2 重新填写，原文件会保留。\n'
-    else printf '节点尚未配置。菜单 1 安装 / 2 修改节点。\n'; fi
+    if [[ ${CNE_CONFIG_INVALID:-0} == 1 ]]; then printf '节点设置无效。主菜单 2 重新填写，原文件会保留。\n'
+    else printf '节点尚未配置。主菜单：1 安装 / 2 修改节点。\n'; fi
     printf '管理目录：%s\n' "$CNE_STATE"
 }
 
@@ -518,7 +548,7 @@ cne_transaction_abort() {
     CNE_TRANSACTION_ACTIVE=0
     if ((failures)); then
         printf 'rollback-incomplete\n' > "$directory/transaction-status"
-        cne_error "恢复未全部完成；请选择“15. 重试恢复”后再进行其他操作。记录：$directory"
+        cne_error "恢复未全部完成；请选择“维护与设置 → 重试恢复”后再进行其他操作。记录：$directory"
         return 1
     fi
     printf 'rolled-back\n' > "$directory/transaction-status" || return 1
@@ -705,16 +735,19 @@ cne_install() {
     if ! cne_verify_install || ! cne_transaction_publish; then cne_transaction_abort || :; return 1; fi
     printf '\n安装和链路验证完成。\n客户端配置目录：%s\n' "$CNE_STATE/clients"
     cne_client_delivery_hint "$CNE_STATE/clients/iPhone.conf"
-    printf '选择“12. 显示配置与二维码”，将对应设备的配置导入客户端。\n\n'
+    printf '选择“客户端管理 → 显示配置与二维码”，将对应设备的配置导入客户端。\n\n'
     cne_status
 }
 cne_status() {
     local idx result=0
     if ! cne_configured; then cne_unconfigured_status; return 0; fi
-    printf '\n节点状态\n'; cne_line
+    if [[ ${CNE_UI_PAGE:-} != 节点状态 ]]; then printf '\n节点状态\n'; cne_line; fi
     for idx in 0 1 2; do
         printf '\n%s · %s\n' "${CNE_LABELS[$idx]}" "$(cne_display_host "$idx")"
-        if ! cne_authenticate "$idx"; then cne_note '此节点认证未完成，继续查看其他节点。'; result=1; continue; fi
+        if ! cne_authenticate "$idx"; then
+            [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
+            cne_note '此节点认证未完成，继续查看其他节点。'; result=1; continue
+        fi
         if ! cne_remote "$idx" status; then result=1; CNE_AUTH_READY[$idx]=0; fi
     done
     cne_line
@@ -728,7 +761,10 @@ cne_action_all() {
             if ! cne_configured; then cne_unconfigured_status; return 0; fi
             for idx in "${order[@]}"; do
                 printf '\n%s · %s\n' "${CNE_LABELS[$idx]}" "$(cne_display_host "$idx")"
-                if ! cne_authenticate "$idx"; then cne_note '此节点认证未完成，继续查看其他节点。'; result=1; continue; fi
+                if ! cne_authenticate "$idx"; then
+                    [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 1
+                    cne_note '此节点认证未完成，继续查看其他节点。'; result=1; continue
+                fi
                 if ! cne_remote "$idx" "$action"; then result=1; CNE_AUTH_READY[$idx]=0; fi
             done
             return "$result";;
@@ -749,7 +785,7 @@ cne_action_all() {
         else
             printf '\n节点服务命令已完成，正在确认链路…\n'
             if cne_verify_install; then printf '节点链路已通过验证；设备的公网连接请在客户端确认。\n'
-            else cne_note '服务命令已完成，但链路验证失败。请选择“4. 连接诊断”或“8. 查看日志”。'; result=1; fi
+            else cne_note '服务命令已完成，但链路验证失败。请到“状态与服务”查看连接诊断或日志。'; result=1; fi
         fi
     fi
     return "$result"
@@ -835,7 +871,7 @@ cne_client_add() {
     mv "$pending" "$CNE_STATE/clients/$name.conf" || return 1
     printf '客户端已添加：%s\n配置：%s\n' "$name" "$CNE_STATE/clients/$name.conf"
     cne_client_delivery_hint "$CNE_STATE/clients/$name.conf"
-    printf '选择“12. 显示配置与二维码”完成导入。\n'
+    printf '选择“客户端管理 → 显示配置与二维码”完成导入。\n'
 }
 cne_client_pick_local() {
     local file name index answer matched explicit_name names=()
@@ -1051,56 +1087,101 @@ cne_client_remove() {
     cne_client_mark_revoked "$file" || return 1
     printf '客户端已撤销。\n'
 }
-cne_menu_show() {
-    printf '\n'; cne_line
-    printf '  一键安装与管理  v%s\n' "$CNE_VERSION"
-    cne_line
-    printf '\n  1. 一键安装\n  2. 修改节点\n  3. 查看状态\n  4. 连接诊断\n\n'
-    printf '  5. 启动服务\n  6. 停止服务\n  7. 重启服务\n  8. 查看日志\n  9. 备份配置\n\n'
-    printf '  10. 客户端列表\n  11. 添加客户端\n  12. 显示配置与二维码\n  13. 撤销客户端\n\n'
-    printf '  14. 卸载服务\n'
-    [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || printf '  15. 重试恢复上次未完成操作\n'
-    printf '  16. 恢复历史备份\n  17. 证书续期与自动维护\n  18. 配置下载来源\n  19. 组件离线包\n'
-    printf '  m. 显示菜单\n  0. 退出\n\n'
-}
-cne_menu() {
-    local choice prompt
-    cne_menu_show
+cne_menu_pending() { [[ -e $CNE_STATE/active-transaction || -L $CNE_STATE/active-transaction ]]; }
+cne_menu_services() {
+    local choice
     while :; do
-        prompt='请选择（m 菜单 / 0 退出）'
-        [[ ! -e $CNE_STATE/active-transaction && ! -L $CNE_STATE/active-transaction ]] || prompt='请选择（15 恢复未完成操作 / m 菜单 / 0 退出）'
-        cne_prompt "$prompt" || return 0; choice=$CNE_ANSWER
+        [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 0
+        cne_ui_header '状态与服务'
+        printf '  1. 查看状态\n  2. 连接诊断\n  3. 启动服务\n  4. 停止服务\n  5. 重启服务\n  6. 查看日志\n  0. 返回主菜单\n\n'
+        cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
         case $choice in
             0) return 0;;
-            m|M) cne_menu_show;;
-            1) cne_install || cne_note '操作未完成，具体原因见上方。';;
-            2) cne_setup || cne_note '节点设置未完成。';;
-            3) cne_status || cne_note '部分节点不可用。';;
-            4) cne_action_all doctor || cne_note '部分检查未通过。';;
-            5) cne_action_all start || cne_note '部分节点启动失败。';;
-            6) cne_action_all stop || cne_note '部分节点停止失败。';;
-            7) cne_action_all restart || cne_note '部分节点重启失败。';;
-            8) cne_action_all logs || cne_note '部分日志读取失败。';;
-            9) cne_backup_create || cne_note '备份未完成，具体原因见上方。';;
-            10) cne_clients_list || cne_note '客户端列表读取失败。';;
-            11) cne_client_add || cne_note '客户端添加未完成。';;
-            12) cne_client_export || cne_note '配置导出未完成。';;
-            13) cne_client_remove || cne_note '客户端撤销未完成。';;
-            14)
-                printf '\n将卸载三个节点的本工具服务，并先保存配置备份。\n'
-                cne_prompt '确认卸载请输入 UNINSTALL' || return 0
-                [[ $CNE_ANSWER != UNINSTALL ]] || cne_action_all uninstall || cne_note '部分节点卸载未完成。';;
-            15) cne_require_config && cne_transaction_recover || cne_note '恢复尚未完成，原备份和记录已保留。';;
-            16) cne_backup_restore || cne_note '恢复未完成，备份和记录已保留。';;
-            17) cne_renew_menu || cne_note '证书维护未完成，具体原因见上方。';;
-            18) cne_download_setup || cne_note '下载来源设置未完成。';;
-            19) cne_download_bundle_menu || cne_note '组件离线包操作未完成。';;
-            *) cne_note '请输入编号，或输入 m 查看菜单。';;
+            1) cne_ui_action '节点状态' '部分节点不可用。' cne_status || return 0;;
+            2) cne_ui_action '连接诊断' '部分检查未通过。' cne_action_all doctor || return 0;;
+            3) cne_ui_action '启动服务' '部分节点启动失败。' cne_action_all start || return 0;;
+            4) cne_ui_action '停止服务' '部分节点停止失败。' cne_action_all stop || return 0;;
+            5) cne_ui_action '重启服务' '部分节点重启失败。' cne_action_all restart || return 0;;
+            6) cne_ui_action '查看日志' '部分日志读取失败。' cne_action_all logs || return 0;;
+            *) cne_note '请输入菜单中的编号。'; cne_ui_pause || return 0;;
         esac
-        printf '\n'
+    done
+}
+cne_menu_clients() {
+    local choice
+    while :; do
+        [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 0
+        cne_ui_header '客户端管理'
+        printf '  1. 客户端列表\n  2. 添加客户端\n  3. 显示配置与二维码\n  4. 撤销客户端\n  0. 返回主菜单\n\n'
+        cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
+        case $choice in
+            0) return 0;;
+            1) cne_ui_action '客户端列表' '客户端列表读取失败。' cne_clients_list || return 0;;
+            2) cne_ui_action '添加客户端' '客户端添加未完成。' cne_client_add || return 0;;
+            3) cne_ui_action '显示配置与二维码' '配置导出未完成。' cne_client_export || return 0;;
+            4) cne_ui_action '撤销客户端' '客户端撤销未完成。' cne_client_remove || return 0;;
+            *) cne_note '请输入菜单中的编号。'; cne_ui_pause || return 0;;
+        esac
+    done
+}
+cne_menu_uninstall() {
+    cne_mutation_guard && cne_require_config || return 1
+    printf '将卸载三个节点的本工具服务，并先保存配置备份。\n'
+    cne_prompt '确认卸载请输入 UNINSTALL' || return 1
+    [[ $CNE_ANSWER == UNINSTALL ]] || { printf '已取消。\n'; return 0; }
+    cne_action_all uninstall
+}
+cne_menu_recover() { cne_require_config && cne_transaction_recover; }
+cne_menu_maintenance() {
+    local choice
+    while :; do
+        [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 0
+        cne_ui_header '维护与设置'
+        printf '  1. 备份配置\n  2. 恢复历史备份\n  3. 证书续期与自动维护\n  4. 配置下载来源\n  5. 组件离线包\n  6. 卸载服务\n'
+        if cne_menu_pending; then printf '  7. 重试恢复未完成操作\n'; fi
+        printf '  0. 返回主菜单\n\n'
+        cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
+        case $choice in
+            0) return 0;;
+            1) cne_ui_action '备份配置' '备份未完成，具体原因见上方。' cne_backup_create || return 0;;
+            2) cne_ui_action '恢复历史备份' '恢复未完成，备份和记录已保留。' cne_backup_restore || return 0;;
+            3)
+                if ! cne_renew_menu; then cne_note '证书维护未完成，具体原因见上方。'; cne_ui_pause || return 0; fi
+                continue;;
+            4) cne_ui_action '配置下载来源' '下载来源设置未完成。' cne_download_setup || return 0;;
+            5)
+                if ! cne_download_bundle_menu; then cne_note '组件离线包操作未完成。'; cne_ui_pause || return 0; fi
+                continue;;
+            6) cne_ui_action '卸载服务' '部分节点卸载未完成。' cne_menu_uninstall || return 0;;
+            7)
+                if cne_menu_pending; then cne_ui_action '恢复未完成操作' '恢复尚未完成，原备份和记录已保留。' cne_menu_recover || return 0
+                else cne_note '当前没有未完成操作。'; cne_ui_pause || return 0; fi;;
+            *) cne_note '请输入菜单中的编号。'; cne_ui_pause || return 0;;
+        esac
+    done
+}
+cne_menu() {
+    local choice
+    while :; do
+        [[ ${CNE_INPUT_ENDED:-0} == 0 ]] || return 0
+        cne_ui_header '一键安装与管理'
+        printf '  1. 一键安装\n  2. 修改节点\n  3. 状态与服务\n  4. 客户端管理\n  5. 维护与设置\n  0. 退出\n\n'
+        if [[ ${CNE_CONFIG_INVALID:-0} == 1 ]]; then printf '节点设置无效，请选 2 重新填写。\n\n'; fi
+        if cne_menu_pending; then printf '有未完成操作，请选 5 → 7 重试恢复。\n\n'; fi
+        cne_prompt '请选择' || return 0; choice=$CNE_ANSWER
+        case $choice in
+            0) return 0;;
+            1) cne_ui_action '一键安装' '操作未完成，具体原因见上方。' cne_install || return 0;;
+            2) cne_ui_action '修改节点' '节点设置未完成。' cne_setup || return 0;;
+            3) cne_menu_services;;
+            4) cne_menu_clients;;
+            5) cne_menu_maintenance;;
+            *) cne_note '请输入菜单中的编号。'; cne_ui_pause || return 0;;
+        esac
     done
 }
 cne_main() {
+    local startup_warning=0
     CNE_RUNNING_SCRIPT=${BASH_SOURCE[0]}
     case ${1:-menu} in
         --help|-h) printf '一键安装与管理（纯 Bash）\n用法：bash cn-egress-oneclick.sh [menu|install|status|doctor|backup|renew|renew-auto]\n支持 Debian 12+、Ubuntu 22.04+，无需 Python。\n'; return 0 ;;
@@ -1111,6 +1192,11 @@ cne_main() {
     esac
     cne_bootstrap ui || return 1
     cne_initialize || return $?
-    cne_download_load || cne_note '下载设置无效；状态和离线配置仍可查看，请通过“18. 配置下载来源”修正。'
+    [[ ${CNE_CONFIG_INVALID:-0} == 0 ]] || startup_warning=1
+    if ! cne_download_load; then
+        cne_note '下载设置无效；状态和离线配置仍可查看，请通过“维护与设置 → 配置下载来源”修正。'
+        startup_warning=1
+    fi
+    if [[ ${1:-menu} == menu && $startup_warning == 1 ]]; then cne_ui_pause || return 0; fi
     case ${1:-menu} in menu) cne_menu;; install) cne_install;; status) cne_status;; doctor) cne_action_all doctor;; backup) cne_backup_create;; renew) cne_renew_certificates;; renew-auto) cne_renew_auto || return 1;; esac
 }

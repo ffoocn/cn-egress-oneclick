@@ -73,7 +73,7 @@ cne_download_verified() {
     cne_note "下载${label}…"
     if ! curl -fL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$temporary"; then
         rm -f "$temporary"
-        cne_error "${label}下载失败：${url}。请在菜单 18 设置下载来源，或在菜单 19 导入已校验缓存后重试。"
+        cne_error "${label}下载失败：${url}。请进入“维护与设置 → 配置下载来源”调整来源，或在“组件离线包”导入已校验缓存后重试。"
         return 1
     fi
     actual=$(sha256sum "$temporary" | awk '{print $1}') || { rm -f "$temporary"; return 1; }
@@ -351,13 +351,29 @@ cne_download_prepare_cache() (
 
 cne_download_bundle_menu() {
     local choice file
-    printf '\n组件缓存\n  1. 导出当前缓存\n  2. 导入缓存包\n  3. 准备完整缓存（需联网下载并编译）\n  0. 取消\n'
-    cne_prompt '请选择' 0 || return 1; choice=$CNE_ANSWER
-    case $choice in
-        0) return 0;;
-        1) cne_prompt '输出绝对路径' "$CNE_STATE/component-cache-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || return 1; file=$CNE_ANSWER; cne_download_bundle_export "$file";;
-        2) cne_prompt '缓存包绝对路径' || return 1; file=$CNE_ANSWER; cne_download_bundle_import "$file";;
-        3) cne_download_prepare_cache;;
-        *) cne_error '请输入 0、1、2 或 3。'; return 1;;
-    esac
+    while :; do
+        cne_ui_header '组件离线包'
+        printf '  1. 导出当前缓存\n  2. 导入缓存包\n  3. 准备完整缓存（需联网下载并编译）\n  0. 返回\n\n'
+        cne_prompt '请选择' 0 || return 0; choice=$CNE_ANSWER
+        case $choice in
+            0) return 0;;
+            1)
+                cne_ui_header '导出组件缓存'
+                cne_prompt '输出绝对路径（0 取消）' "$CNE_STATE/component-cache-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || return 0
+                file=$CNE_ANSWER
+                [[ $file != 0 ]] || continue
+                cne_download_bundle_export "$file" || cne_note '缓存导出未完成。'
+                ;;
+            2)
+                cne_ui_header '导入组件缓存'
+                cne_prompt '缓存包绝对路径（0 取消）' || return 0
+                file=$CNE_ANSWER
+                [[ $file != 0 ]] || continue
+                cne_download_bundle_import "$file" || cne_note '缓存导入未完成。'
+                ;;
+            3) cne_ui_header '准备完整组件缓存'; cne_download_prepare_cache || cne_note '缓存准备未完成。';;
+            *) cne_note '请输入菜单中的编号。';;
+        esac
+        cne_ui_pause || return 0
+    done
 }

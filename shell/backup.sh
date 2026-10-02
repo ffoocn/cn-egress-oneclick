@@ -176,7 +176,7 @@ cne_backup_pick() {
             printf '  %s. %s（UTC）\n' "${#entries[@]}" "${directory##*/}"
         else cne_note "跳过不完整、校验失败或缺少完整服务的备份：${directory##*/}"; fi
     done
-    ((${#entries[@]})) || { cne_error '没有完整且通过校验的历史备份，请先使用“9. 备份配置”。'; return 1; }
+    ((${#entries[@]})) || { cne_error '没有完整且通过校验的历史备份，请先进入“维护与设置 → 备份配置”。'; return 1; }
     while :; do
         cne_prompt '请选择备份编号（0 取消）' || return 1; answer=$CNE_ANSWER
         [[ $answer != 0 ]] || return 0

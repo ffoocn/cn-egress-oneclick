@@ -46,9 +46,11 @@ qrencode() { fail 'missing QR renderer was invoked'; }
 # bootstrap, the actual menu and the actual configuration-export fallback.
 cne_initialize() { cne_load_config; }
 
-cne_main menu <<<'12
+cne_main menu <<<'4
+3
 phone
 2
+0
 0' > "$WORK/output" 2>&1 || fail 'missing VPN/SSH tools or broken dpkg blocked offline menu export'
 grep -Fq 'PrivateKey = offline-fixture-private-key' "$WORK/output" || fail 'menu did not display the existing client file'
 grep -Fq "$CNE_STATE/clients/phone.conf" "$WORK/output" || fail 'menu did not provide the existing file path'
@@ -57,12 +59,14 @@ grep -Fq '离线查看不连接服务器，也不安装依赖' "$WORK/output" ||
 if grep -Eq '操作未完成|配置导出未完成' "$WORK/output"; then fail 'offline export was reported as a failed action'; fi
 printf 'PASS: real menu exports a saved profile despite missing VPN/SSH tools, missing CA package and broken dpkg\n'
 printf 'unrecognized\tsetting\n' > "$CNE_STATE/downloads.tsv"
-cne_main menu <<<'12
+cne_main menu <<<'4
+3
 phone
 2
+0
 0' > "$WORK/invalid-downloads" 2>&1 || fail 'invalid download settings blocked offline management'
 grep -Fq 'PrivateKey = offline-fixture-private-key' "$WORK/invalid-downloads" || fail 'invalid download settings blocked saved profile display'
-grep -Fq '18. 配置下载来源' "$WORK/invalid-downloads" || fail 'invalid download settings did not identify the repair entry'
+grep -Fq '维护与设置' "$WORK/invalid-downloads" && grep -Fq '配置下载来源' "$WORK/invalid-downloads" || fail 'invalid download settings did not identify the repair entry'
 [[ ! -s $TRACE ]] || fail 'invalid download settings prepared unrelated dependencies'
 printf 'PASS: malformed download settings leave offline management and the repair menu accessible\n'
 CNE_AUTH_READY[0]=1

@@ -63,9 +63,13 @@ assert_no_configuration_writes() {
 test_empty_menu() (
     setup empty-menu
     cne_main menu <<<'3
+1
+2
+6
+0
 4
-8
-10
+1
+0
 0' > "$OUTPUT" 2>&1 || fail 'fresh menu did not remain usable after read-only choices'
     contains "$OUTPUT" "$CNE_STATE"
     [[ $(grep -c '节点尚未配置' "$OUTPUT" || true) -ge 3 ]] || fail 'status, diagnosis and logs did not identify the unconfigured manager'
@@ -219,9 +223,13 @@ test_invalid_configuration_offline_menu() (
     if [[ $kind == symlink ]]; then ln -s "$original" "$CNE_STATE/nodes.tsv"
     else cp "$original" "$CNE_STATE/nodes.tsv"; fi
     cne_main menu <<<'3
-12
+1
+0
+4
+3
 phone
 2
+0
 0' > "$OUTPUT" 2>&1 || fail 'invalid saved settings blocked the management and offline file menus'
     [[ $CNE_CONFIG_INVALID == 1 ]] || fail 'invalid saved settings were not explicitly flagged'
     [[ -z ${CNE_HOSTS[0]} && -z ${CNE_HOSTS[1]} && -z ${CNE_HOSTS[2]} ]] || fail 'failed initialization retained a partially configured node'

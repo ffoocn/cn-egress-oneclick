@@ -336,7 +336,7 @@ test_setup_pending_journal() (
     if cne_setup > "$CNE_STATE/output" 2>&1; then fail 'pending recovery allowed node changes'; fi
     cmp "$CNE_STATE/nodes.before" "$CNE_STATE/nodes.tsv" || fail 'pending recovery changed saved nodes'
     [[ -e $CNE_STATE/active-transaction || -L $CNE_STATE/active-transaction ]] || fail 'pending recovery marker was removed'
-    grep -Fq '15. 重试恢复' "$CNE_STATE/output" || fail 'pending recovery did not provide an actionable menu instruction'
+    grep -Fq '维护与设置 → 重试恢复' "$CNE_STATE/output" || fail 'pending recovery did not provide an actionable menu instruction'
     [[ ! -s $MOCK_TRACE ]] || fail 'blocked setup requested connections or authentication'
     printf 'PASS: pending %s recovery marker prevents settings changes before asking questions\n' "$kind"
 )

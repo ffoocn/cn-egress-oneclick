@@ -313,9 +313,17 @@ cne_renew_timer_status() {
 }
 cne_renew_menu() {
     while :; do
-        printf '\n证书续期与自动维护\n'; cne_line
-        printf '  1. 立即更新证书\n  2. 启用每天自动检查\n  3. 关闭自动检查\n  4. 查看定时维护状态和日志\n  0. 返回\n'
+        cne_ui_header '证书续期与自动维护'
+        printf '  1. 立即更新证书\n  2. 启用每天自动检查\n  3. 关闭自动检查\n  4. 查看定时维护状态和日志\n  0. 返回\n\n'
         cne_prompt '请选择' || return 0
-        case $CNE_ANSWER in 1) cne_renew_certificates || cne_note '证书更新未完成。';; 2) cne_renew_timer_enable || :;; 3) cne_renew_timer_disable || :;; 4) cne_renew_timer_status || :;; 0) return 0;; *) cne_note '请输入菜单中的编号。';; esac
+        case $CNE_ANSWER in
+            1) cne_ui_header '立即更新证书'; cne_renew_certificates || cne_note '证书更新未完成。';;
+            2) cne_ui_header '启用每天自动检查'; cne_renew_timer_enable || cne_note '自动检查启用未完成。';;
+            3) cne_ui_header '关闭自动检查'; cne_renew_timer_disable || cne_note '自动检查关闭未完成。';;
+            4) cne_ui_header '定时维护状态和日志'; cne_renew_timer_status || :;;
+            0) return 0;;
+            *) cne_note '请输入菜单中的编号。';;
+        esac
+        cne_ui_pause || return 0
     done
 }

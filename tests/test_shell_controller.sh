@@ -435,12 +435,28 @@ test_menu() (
     CNE_STATE=$WORK/menu-state
     cne_menu <<< '0' > "$WORK/menu" 2>&1
     local item count
-    for item in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    for item in 0 1 2 3 4 5; do
         count=$(grep -Ec "^  $item\\. [^[:cntrl:]]+$" "$WORK/menu" || true)
         [[ $count == 1 ]] || fail "menu item $item is missing or not on its own line"
     done
     if grep -Eq '^  [0-9]+\. .* [0-9]+\. ' "$WORK/menu"; then fail 'menu contains multiple items on one line'; fi
-    printf 'PASS: menu items occupy separate lines\n'
+    for item in '3. 状态与服务' '4. 客户端管理' '5. 维护与设置'; do
+        grep -Fq "$item" "$WORK/menu" || fail "main menu is missing group: $item"
+    done
+    if grep -Eq '^  ([6-9]|[0-9]{2,})\. ' "$WORK/menu"; then fail 'main menu still mixes grouped operations into one long list'; fi
+    cne_menu <<<'3
+0
+4
+0
+5
+0
+0' > "$WORK/submenus" 2>&1
+    for item in '1. 查看状态' '6. 查看日志' '1. 客户端列表' '4. 撤销客户端' '1. 备份配置' '6. 卸载服务'; do
+        grep -Fq "$item" "$WORK/submenus" || fail "submenu is missing operation: $item"
+    done
+    [[ $(grep -c '0. 返回' "$WORK/submenus" || true) == 3 ]] || fail 'each operation group must return to the main menu'
+    if LC_ALL=C grep -q $'\033' "$WORK/submenus"; then fail 'noninteractive menu wrote terminal control characters'; fi
+    printf 'PASS: concise main menu opens each grouped submenu and returns without terminal control codes or pause-input consumption\n'
 )
 
 test_fresh

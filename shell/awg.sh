@@ -63,7 +63,7 @@ cne_fetch_awg() {
         GOPRIVATE= GONOSUMDB= GONOPROXY= GOINSECURE= GOCACHE="$work/gocache" \
         GOMODCACHE="$work/gomodcache" GOPROXY="$CNE_GO_PROXY" \
         GOSUMDB=sum.golang.org "$work/go/bin/go" build -mod=readonly -trimpath \
-        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请在菜单 18 检查 Go 模块代理，或在菜单 19 准备/导入完整缓存后重试。'; return 1; }
+        -buildvcs=false -o "$work/amneziawg-go" .) || { cne_awg_cleanup "$work" || :; cne_error 'AmneziaWG 编译或 Go 依赖下载失败（最长等待 10 分钟）。配置尚未替换；请在“维护与设置 → 配置下载来源”检查 Go 模块代理，或在“维护与设置 → 组件离线包”准备/导入完整缓存后重试。'; return 1; }
     cne_download_modules_publish "$work" "$target" "$engine_archive" || { cne_awg_cleanup "$work" || :; return 1; }
     chmod 755 "$work/amneziawg-go" || return 1
     existing=$(sha256sum "$work/amneziawg-go" | awk '{print $1}') || return 1
